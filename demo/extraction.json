@@ -1,0 +1,342 @@
+{
+  "title": "備品の保管と直前の保管の取消",
+  "observations": [
+    {
+      "id": "O000",
+      "image_id": "F000",
+      "visible_state": "白い画面。"
+    },
+    {
+      "id": "O001",
+      "image_id": "F001",
+      "visible_state": "白い画面。"
+    },
+    {
+      "id": "O002",
+      "image_id": "F002",
+      "visible_state": "白い画面。"
+    },
+    {
+      "id": "O003",
+      "image_id": "F003",
+      "visible_state": "「備品の保管」画面。選択0件、「保管対象を選択してください」。EQ-17 予備モニターとEQ-28 会議用マイクはいずれも使用中、未選択。「選択した備品を保管」「直前の保管を取り消す」ボタンがある。"
+    },
+    {
+      "id": "O004",
+      "image_id": "F004",
+      "visible_state": "選択0件。EQ-17、EQ-28とも未選択、使用中。"
+    },
+    {
+      "id": "O005",
+      "image_id": "F005",
+      "visible_state": "選択0件。EQ-17、EQ-28とも未選択、使用中。"
+    },
+    {
+      "id": "O006",
+      "image_id": "F006",
+      "visible_state": "選択0件。EQ-17、EQ-28とも未選択、使用中。"
+    },
+    {
+      "id": "O007",
+      "image_id": "F007",
+      "visible_state": "選択1件。EQ-17が選択され、EQ-28は未選択。両方とも使用中。"
+    },
+    {
+      "id": "O008",
+      "image_id": "F008",
+      "visible_state": "選択1件。EQ-17が選択され、EQ-28は未選択。"
+    },
+    {
+      "id": "O009",
+      "image_id": "F009",
+      "visible_state": "選択1件。EQ-17が選択され、EQ-28は未選択。"
+    },
+    {
+      "id": "O010",
+      "image_id": "F010",
+      "visible_state": "選択2件。EQ-17とEQ-28が選択され、両方とも使用中。"
+    },
+    {
+      "id": "O011",
+      "image_id": "F011",
+      "visible_state": "選択2件。EQ-17とEQ-28が選択され、両方とも使用中。"
+    },
+    {
+      "id": "O012",
+      "image_id": "F012",
+      "visible_state": "選択2件。EQ-17とEQ-28が選択され、両方とも使用中。"
+    },
+    {
+      "id": "O013",
+      "image_id": "F013",
+      "visible_state": "選択2件。EQ-17とEQ-28が選択され、両方とも使用中。"
+    },
+    {
+      "id": "O014",
+      "image_id": "F014",
+      "visible_state": "「備品を保管しますか」の確認画面に「2件：EQ-17、EQ-28」と「保管する」「戻る」が表示されている。"
+    },
+    {
+      "id": "O015",
+      "image_id": "F015",
+      "visible_state": "2件、EQ-17とEQ-28の保管確認画面。"
+    },
+    {
+      "id": "O016",
+      "image_id": "F016",
+      "visible_state": "2件、EQ-17とEQ-28の保管確認画面。"
+    },
+    {
+      "id": "O017",
+      "image_id": "F017",
+      "visible_state": "2件、EQ-17とEQ-28の保管確認画面。"
+    },
+    {
+      "id": "O018",
+      "image_id": "F018",
+      "visible_state": "確認画面が閉じ、EQ-17とEQ-28は選択されたまま、両方とも使用中。"
+    },
+    {
+      "id": "O019",
+      "image_id": "F019",
+      "visible_state": "選択2件。EQ-17とEQ-28は選択されたまま、両方とも使用中。"
+    },
+    {
+      "id": "O020",
+      "image_id": "F020",
+      "visible_state": "選択2件。EQ-17とEQ-28は選択されたまま、両方とも使用中。"
+    },
+    {
+      "id": "O021",
+      "image_id": "F021",
+      "visible_state": "選択2件。EQ-17とEQ-28は選択されたまま、両方とも使用中。"
+    },
+    {
+      "id": "O022",
+      "image_id": "F022",
+      "visible_state": "選択1件。EQ-17は選択済み、EQ-28は未選択。両方とも使用中。"
+    },
+    {
+      "id": "O023",
+      "image_id": "F023",
+      "visible_state": "選択1件。EQ-17は選択済み、EQ-28は未選択。"
+    },
+    {
+      "id": "O024",
+      "image_id": "F024",
+      "visible_state": "選択1件。EQ-17は選択済み、EQ-28は未選択。"
+    },
+    {
+      "id": "O025",
+      "image_id": "F025",
+      "visible_state": "「備品を保管しますか」の確認画面に「1件：EQ-17」と「保管する」「戻る」が表示されている。"
+    },
+    {
+      "id": "O026",
+      "image_id": "F026",
+      "visible_state": "1件、EQ-17の保管確認画面。"
+    },
+    {
+      "id": "O027",
+      "image_id": "F027",
+      "visible_state": "1件、EQ-17の保管確認画面。"
+    },
+    {
+      "id": "O028",
+      "image_id": "F028",
+      "visible_state": "1件、EQ-17の保管確認画面。"
+    },
+    {
+      "id": "O029",
+      "image_id": "F029",
+      "visible_state": "確認画面が閉じ、「保管処理中」と表示。EQ-17は選択済みで使用中、EQ-28は未選択で使用中。"
+    },
+    {
+      "id": "O030",
+      "image_id": "F030",
+      "visible_state": "「保管処理中」。EQ-17は選択済みで使用中、EQ-28は未選択で使用中。"
+    },
+    {
+      "id": "O031",
+      "image_id": "F031",
+      "visible_state": "「1件の保管が完了しました」。選択0件。EQ-17は保管済み、EQ-28は使用中。"
+    },
+    {
+      "id": "O032",
+      "image_id": "F032",
+      "visible_state": "「1件の保管が完了しました」。EQ-17は保管済み、EQ-28は使用中。"
+    },
+    {
+      "id": "O033",
+      "image_id": "F033",
+      "visible_state": "「1件の保管が完了しました」。EQ-17は保管済み、EQ-28は使用中。"
+    },
+    {
+      "id": "O034",
+      "image_id": "F034",
+      "visible_state": "「1件の保管が完了しました」。EQ-17は保管済み、EQ-28は使用中。"
+    },
+    {
+      "id": "O035",
+      "image_id": "F035",
+      "visible_state": "「保管の取消処理中」。選択0件、EQ-17は保管済み、EQ-28は使用中。"
+    },
+    {
+      "id": "O036",
+      "image_id": "F036",
+      "visible_state": "「保管の取消処理中」。EQ-17は保管済み、EQ-28は使用中。"
+    },
+    {
+      "id": "O037",
+      "image_id": "F037",
+      "visible_state": "「保管の取消処理中」。EQ-17は保管済み、EQ-28は使用中。"
+    },
+    {
+      "id": "O038",
+      "image_id": "F038",
+      "visible_state": "「保管の取消処理中」。EQ-17は保管済み、EQ-28は使用中。"
+    },
+    {
+      "id": "O039",
+      "image_id": "F039",
+      "visible_state": "「保管の取消処理中」。EQ-17は保管済み、EQ-28は使用中。"
+    }
+  ],
+  "events": [
+    {
+      "id": "E01",
+      "title": "EQ-17を選択",
+      "target": "予備モニター EQ-17",
+      "observed_change": "チェックが入り、選択が0件から1件になった。",
+      "value": "EQ-17",
+      "observation_ids": [
+        "O006",
+        "O007"
+      ],
+      "anchor_observation_id": "O007",
+      "status": "inferred_transition",
+      "uncertainty": "選択の操作方法は映っていない。"
+    },
+    {
+      "id": "E02",
+      "title": "EQ-28を追加選択",
+      "target": "会議用マイク EQ-28",
+      "observed_change": "EQ-28にもチェックが入り、選択が2件になった。",
+      "value": "EQ-17、EQ-28",
+      "observation_ids": [
+        "O009",
+        "O010"
+      ],
+      "anchor_observation_id": "O010",
+      "status": "inferred_transition",
+      "uncertainty": "選択の操作方法は映っていない。"
+    },
+    {
+      "id": "E03",
+      "title": "2件の保管確認",
+      "target": "保管確認画面",
+      "observed_change": "EQ-17、EQ-28の2件について保管確認画面が表示された。",
+      "value": "2件：EQ-17、EQ-28",
+      "observation_ids": [
+        "O013",
+        "O014"
+      ],
+      "anchor_observation_id": "O014",
+      "status": "inferred_transition",
+      "uncertainty": "確認画面を開いた操作方法は映っていない。"
+    },
+    {
+      "id": "E04",
+      "title": "確認画面から戻る",
+      "target": "保管確認画面",
+      "observed_change": "確認画面が閉じ、2件を選択したままの一覧に戻った。両備品は使用中のまま。",
+      "value": "選択2件",
+      "observation_ids": [
+        "O017",
+        "O018"
+      ],
+      "anchor_observation_id": "O018",
+      "status": "inferred_transition",
+      "uncertainty": "画面を閉じた方法は映っていない。"
+    },
+    {
+      "id": "E05",
+      "title": "EQ-28の選択解除",
+      "target": "会議用マイク EQ-28",
+      "observed_change": "EQ-28のチェックが外れ、EQ-17のみの選択になった。",
+      "value": "選択1件：EQ-17",
+      "observation_ids": [
+        "O021",
+        "O022"
+      ],
+      "anchor_observation_id": "O022",
+      "status": "inferred_transition",
+      "uncertainty": "選択解除の操作方法は映っていない。"
+    },
+    {
+      "id": "E06",
+      "title": "1件の保管確認",
+      "target": "保管確認画面",
+      "observed_change": "EQ-17の1件について保管確認画面が表示された。",
+      "value": "1件：EQ-17",
+      "observation_ids": [
+        "O024",
+        "O025"
+      ],
+      "anchor_observation_id": "O025",
+      "status": "inferred_transition",
+      "uncertainty": "確認画面を開いた操作方法は映っていない。"
+    },
+    {
+      "id": "E07",
+      "title": "保管処理中",
+      "target": "EQ-17",
+      "observed_change": "確認画面が閉じ、「保管処理中」と表示された。",
+      "value": "保管処理中",
+      "observation_ids": [
+        "O028",
+        "O029"
+      ],
+      "anchor_observation_id": "O029",
+      "status": "inferred_transition",
+      "uncertainty": "確認画面での操作方法は映っていない。"
+    },
+    {
+      "id": "E08",
+      "title": "保管完了",
+      "target": "EQ-17",
+      "observed_change": "「1件の保管が完了しました」と表示され、EQ-17が保管済みになった。EQ-28は使用中のまま。",
+      "value": "EQ-17：保管済み",
+      "observation_ids": [
+        "O030",
+        "O031"
+      ],
+      "anchor_observation_id": "O031",
+      "status": "observed_state",
+      "uncertainty": ""
+    },
+    {
+      "id": "E09",
+      "title": "保管の取消処理",
+      "target": "直前の保管",
+      "observed_change": "「保管の取消処理中」と表示された。最後の画面でもEQ-17は保管済みと表示されている。",
+      "value": "保管の取消処理中",
+      "observation_ids": [
+        "O034",
+        "O035",
+        "O039"
+      ],
+      "anchor_observation_id": "O039",
+      "status": "inferred_transition",
+      "uncertainty": "取消を開始した操作方法と、処理の最終結果は映っていない。"
+    }
+  ],
+  "questions": [
+    {
+      "question": "保管の取消処理はその後完了したか。EQ-17の最終状態は何か。",
+      "observation_ids": [
+        "O039"
+      ]
+    }
+  ]
+}

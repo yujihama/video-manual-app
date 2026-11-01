@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>動画から手順書</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<header class="appbar">
+  <a class="brand" href="/" aria-label="動画から手順書 ホーム"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 3.5h8l4 4V21H6z"/><path d="M14 3.5V8h4M9 12h6M9 16h6"/></svg><span>動画から手順書</span></a>
+  <div class="app-actions"><button id="history-button" class="button quiet">作成履歴</button><button id="new-button" class="button secondary"><span aria-hidden="true">＋</span> 新しい動画</button></div>
+  <div id="export-bar" class="export-actions hidden"><span id="save-state" role="status"></span><button id="save-button" class="button secondary hidden">編集を保存</button><button id="word-button" class="button secondary">Word</button><button id="zip-button" class="button primary">HTML＋動画ZIP</button></div>
+</header>
+<section id="task-status" class="task-status hidden" aria-live="polite"><span id="progress-dot" class="progress-dot"></span><div class="status-copy"><strong id="status-heading"></strong><p id="status-message"></p></div><div id="status-actions"></div></section>
+<div id="error" role="alert" class="error hidden"></div>
+<main>
+  <section id="empty" class="empty"><div class="empty-content"><svg width="34" height="34" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true"><rect x="4.5" y="7.5" width="23" height="17" rx="3"/><path d="m14 12 7 4-7 4z"/></svg><h1>録画を開く</h1><p>作業動画から、参照時刻と画像が付いた手順書を作成します。</p><div class="empty-actions"><button id="empty-upload" class="button primary">動画を選択</button><button id="sample-button" class="button secondary">サンプルで試す</button></div><small>MP4・WebMなど · 最大300MB</small></div></section>
+  <section id="workspace" class="workspace hidden">
+    <aside class="video-column">
+      <div class="video-heading"><h2>元の動画</h2><span id="video-name"></span></div>
+      <div class="player-panel"><video id="video" controls preload="metadata" playsinline></video><div class="player-meta"><span><span id="video-position">00:00.0</span><span id="video-duration"></span></span><span id="now-step">手順の時刻から再生できます</span></div></div>
+      <div class="chapters-heading"><h2>手順</h2><span id="step-count"></span></div><nav id="step-nav" class="step-nav" aria-label="手順の参照位置"></nav>
+      <details class="source-note"><summary>参照時刻について</summary><p>時刻は根拠画像の範囲です。操作した瞬間を確定するものではありません。音声は再生できますが、手順の抽出には画面だけを使用します。</p></details>
+      <div class="local-meta"><span id="api-status">設定を確認中</span><span id="budget-summary"></span></div>
+    </aside>
+    <article class="manual-column"><div class="document-toolbar"><span>手順書 <span id="sample-badge" class="sample-label hidden">サンプル</span></span><button id="edit-button" class="button quiet">内容を編集</button></div><div class="document-content"><div id="manual-heading"></div><div class="document-meta"><span class="draft-label">下書き</span><span>作業責任者の承認前</span><span id="manual-count"></span></div><div id="steps"></div><section id="questions" class="questions"></section><p class="document-footnote">内容を動画と照合してから使用してください。<span id="sample-explanation" class="hidden">サンプルは保存済みの生成結果です。APIの呼び出しはありません。</span></p></div></article>
+  </section>
+</main>
+<dialog id="upload-dialog" aria-labelledby="upload-title"><div class="dialog-head"><h2 id="upload-title">動画を読み込む</h2><button id="close-upload" class="icon-button" aria-label="動画の選択を閉じる">×</button></div><p class="dialog-description">録画をこのPCへ保存し、手順書の根拠となる画面を抽出します。</p><label class="file-box" for="file"><span class="file-icon" aria-hidden="true">＋</span><strong id="filename">録画ファイルを選ぶ</strong><small>MP4・WebMなど ／ 最大300MB</small><input id="file" type="file" accept="video/*,.mkv,.avi,.m4v"></label><label class="interval-label" for="interval">画面の抽出間隔<select id="interval"><option value=".5">0.5秒（約1分まで）</option><option value="1">1秒（約2分まで）</option><option value="2">2秒（約4分まで）</option></select></label><p class="dialog-footnote">AIでの生成時には、画面画像をOpenAIへ送信します。送信前に内容と最大費用を確認できます。</p><div class="dialog-actions"><button id="cancel-upload" class="button secondary">戻る</button><button id="upload-button" class="button primary" disabled>動画を読み込む</button></div></dialog>
+<dialog id="history" aria-labelledby="history-title"><div class="dialog-head"><h2 id="history-title">作成履歴</h2><button class="icon-button" id="close-history" aria-label="履歴を閉じる">×</button></div><div id="history-items"></div></dialog>
+<dialog id="consent" aria-labelledby="consent-title"><div class="dialog-head"><h2 id="consent-title"></h2></div><p id="consent-message"></p><div class="dialog-actions"><button id="cancel-consent" class="button secondary">戻る</button><button id="confirm-consent" class="button primary">続ける</button></div></dialog>
+<script src="/app.js"></script>
+</body></html>

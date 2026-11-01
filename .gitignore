@@ -1,0 +1,12 @@
+data/
+.venv/
+__pycache__/
+tests-output/
+*.log
+.env*
+runtime/
+ui-revision/
+prepare_demo.py
+polish_ui.py
+.DS_Store
+*.pyc

@@ -1,0 +1,1791 @@
+"""Watch Skill CLI entry point.
+
+Milestone 0 ships `doctor` and `version`; watch/ask/loop/serve arrive with
+their core modules. Progress goes to stderr, results to stdout, so agents can
+pipe cleanly. `--json` flags emit machine-readable output.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.markup import escape
+
+# Pin the output encoding to UTF-8.
+#
+# On Windows a tty goes through the console API and handles Unicode fine, but
+# a pipe or a redirect falls back to the system codepage — cp1256, cp1252,
+# cp932. Reports carry em dashes and, for non-English video, the content's own
+# script, so `watch-skill watch ... > report.md` was writing U+FFFD where the
+# text should be, and anything reading our stdout got the same. Setting only
+# errors="replace" stopped the crash but kept the corruption.
+#
+# errors="replace" stays as the backstop for a stream that cannot be moved to
+# UTF-8 at all.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):  # detached or already-wrapped stream
+            _stream.reconfigure(errors="replace")
+
+app = typer.Typer(
+    name="watch-skill",
+    help="Give any agent a video input: watch, index, ask, and iterate.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+
+_console = Console(stderr=True)
+
+_STATUS_STYLE = {"ok": "green", "warn": "yellow", "fail": "red"}
+
+
+def _plain(value: object) -> str:
+    """Text that was not written as markup, rendered as what it says.
+
+    Rich reads ``[...]`` as a style tag and drops what it cannot resolve.
+    Every instruction this CLI gives for installing an extra contains one --
+    ``pip install "watch-skill[perceive, index, mcp]"`` reached the terminal
+    as ``pip install "watch-skill"``, which reinstalls what the reader
+    already has and leaves them exactly as stuck. The JSON was right the
+    whole time, so nothing looked broken.
+
+    Applies to anything this process did not author as markup: a fix string,
+    an exception, a path, and above all a model's own words.
+    """
+    return escape(str(value))
+
+
+def _render_report(report) -> None:
+    from rich.table import Table
+
+    table = Table(title="watch-skill doctor")
+    table.add_column("check")
+    table.add_column("status")
+    table.add_column("detail", overflow="fold")
+    for check in report.checks:
+        style = _STATUS_STYLE[check.status]
+        detail = check.message
+        if check.fix_applied:
+            detail += f" (auto-fixed: {check.fix_applied})"
+        table.add_row(check.name, f"[{style}]{check.status}[/{style}]", _plain(detail))
+    _console.print(table)
+
+
+@app.command()
+def doctor(
+    fix: bool = typer.Option(True, "--fix/--no-fix", help="Auto-remediate fixable issues."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON to stdout."),
+) -> None:
+    """Check (and self-heal) dependencies: ffmpeg, yt-dlp, deno, disk, GPU, API keys."""
+    from watch_skill.health.doctor import run_doctor
+
+    report = run_doctor(fix=fix)
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        _render_report(report)
+    if not report.ok:
+        raise typer.Exit(code=1) from None
+
+
+@app.command()
+def watch(
+    source: str = typer.Argument(..., help="URL, direct media URL, manifest, or local path."),
+    question: str | None = typer.Argument(None, help="Optional question (echoed in output)."),
+    start: str | None = typer.Option(None, "--start", help="Range start (SS, MM:SS, HH:MM:SS)."),
+    end: str | None = typer.Option(None, "--end", help="Range end (SS, MM:SS, HH:MM:SS)."),
+    max_frames: int | None = typer.Option(None, "--max-frames", help="Override the frame cap."),
+    resolution: int | None = typer.Option(None, "--resolution", help="Frame width px (default 512)."),
+    timestamps: str | None = typer.Option(
+        None, "--timestamps", help="Comma-separated absolute times to pin frames at."
+    ),
+    transcript_only: bool = typer.Option(
+        False, "--transcript-only", help="Skip frames; captions-first fast path."
+    ),
+    no_ocr: bool = typer.Option(False, "--no-ocr", help="Skip the OCR pass."),
+    no_whisper: bool = typer.Option(
+        False, "--no-whisper", help="Disable local whisper fallback (captions only)."
+    ),
+    cloud_stt: bool = typer.Option(
+        False, "--cloud-stt", help="OPT-IN: allow cloud STT for extracted audio."
+    ),
+    whisper_model: str | None = typer.Option(
+        None, "--whisper-model", help="faster-whisper size (tiny..large-v3, default auto)."
+    ),
+    diarize: bool = typer.Option(
+        False, "--diarize", help="Label transcript by speaker (diarize extra + HF token)."
+    ),
+    word_timestamps: bool = typer.Option(
+        False,
+        "--word-timestamps",
+        help="Align each word, so `get_moment` can cite the exact word rather "
+        "than a segment that may run for ten seconds. Costs extra decoding "
+        "time and only applies to the local-whisper rung.",
+    ),
+    duration: float | None = typer.Option(
+        None, "--duration", help="Bound live-stream capture to N seconds."
+    ),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Working directory."),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Bypass the download cache."),
+    index: bool = typer.Option(
+        True, "--index/--no-index", help="Persist to the searchable index (ask/search later)."
+    ),
+    detail: str | None = typer.Option(
+        None,
+        "--detail",
+        help="Frame-budget preset: transcript | efficient | balanced | token-burner.",
+    ),
+) -> None:
+    """Watch a video: acquire -> scenes -> frames -> OCR -> transcript -> report."""
+    from pathlib import Path
+
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.perceive.budget import parse_time
+    from watch_skill.report import render_report
+    from watch_skill.watch import watch as run_watch
+
+    # `--detail` is claude-video's vocabulary. Accepting it means a migrating
+    # user's existing commands run unchanged; each preset just sets the frame
+    # budget this engine already had. An explicit --max-frames still wins.
+    if detail is not None:
+        preset = detail.strip().lower()
+        presets = {
+            "transcript": None,
+            "efficient": 12,
+            "balanced": 32,
+            "token-burner": 96,
+        }
+        if preset not in presets:
+            _console.print(
+                f"[red]error:[/red] unknown --detail {_plain(repr(detail))}; "
+                f"expected one of: {', '.join(presets)}"
+            )
+            raise typer.Exit(code=2) from None
+        if preset == "transcript":
+            transcript_only = True
+        elif max_frames is None:
+            max_frames = presets[preset]
+
+    # Only what the caller typed. A recording that carries its own interaction
+    # moments is read by the engine, so every surface behaves the same way and
+    # this one stays the wrapper it is supposed to be.
+    cues = None
+    if timestamps:
+        cues = [t for t in (parse_time(tok) for tok in timestamps.split(",") if tok.strip()) if t is not None]
+    try:
+        result = run_watch(
+            source,
+            start_seconds=parse_time(start),
+            end_seconds=parse_time(end),
+            max_frames=max_frames,
+            frame_width=resolution,
+            cue_timestamps=cues,
+            transcript_only=transcript_only,
+            run_ocr=False if no_ocr else None,
+            allow_local_whisper=False if no_whisper else None,
+            allow_cloud_stt=True if cloud_stt else None,
+            whisper_model=whisper_model,
+            diarize=True if diarize else None,
+            word_timestamps=word_timestamps,
+            duration_cap=duration,
+            out_dir=Path(out_dir) if out_dir else None,
+            use_cache=not no_cache,
+        )
+    except WatchSkillError as exc:
+        _console.print(f"[red]error:[/red] {_plain(exc)}")
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    if index and result.perception is not None:
+        from watch_skill.index import index_watch_result
+
+        video_id = index_watch_result(result)
+        print(f"> **Indexed:** video_id `{video_id}` — follow up with `watch-skill ask {video_id} ...`\n")
+    if question:
+        print(f"> **Question:** {question}\n")
+    print(render_report(result))
+
+
+@app.command()
+def serve(
+    http: bool = typer.Option(False, "--http", help="Streamable HTTP instead of stdio."),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8747, "--port"),
+) -> None:
+    """Run the MCP server (stdio default; --http for streamable HTTP)."""
+    from watch_skill.surfaces.mcp.server import main as mcp_main
+
+    mcp_main(http=http, host=host, port=port)
+
+
+@app.command()
+def bridge(
+    max_in_flight: int = typer.Option(
+        4, "--max-in-flight", min=1, max=32,
+        help="Concurrent requests served before the Bridge refuses more.",
+    ),
+) -> None:
+    """Serve the Bridge protocol on stdin/stdout for an embedding Host.
+
+    Not an interactive command. A Host (DeepWatch) spawns it as a child process
+    and speaks Content-Length-framed JSON-RPC 2.0 to it. stdout carries
+    protocol frames and nothing else; diagnostics go to stderr.
+    """
+    from watch_skill.surfaces.bridge import serve as bridge_serve
+
+    code = bridge_serve(max_in_flight=max_in_flight)
+    if code != 0:
+        raise typer.Exit(code=code) from None
+
+
+@app.command()
+def api(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8748, "--port"),
+) -> None:
+    """Run the REST API (FastAPI; OpenAPI spec at /openapi.json)."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.surfaces.api import serve as api_serve
+
+    try:
+        api_serve(host=host, port=port)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+
+
+@app.command()
+def ask(
+    video: str = typer.Argument(..., help="video_id or the original source URL/path."),
+    question: str = typer.Argument(...),
+    max_frames: int = typer.Option(6, "--max-frames"),
+    frames: bool = typer.Option(False, "--frames", help="Always list evidence frame paths."),
+    no_verify: bool = typer.Option(False, "--no-verify", help="Skip the model verify pass."),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Bypass the semantic answer cache."),
+) -> None:
+    """Ask an already-indexed video a question (self-healing answer engine)."""
+    from watch_skill.answer import answer_question
+    from watch_skill.errors import WatchSkillError
+
+    try:
+        answer = answer_question(
+            video, question,
+            include_frames=True if frames else None,
+            verify=False if no_verify else None,
+            use_cache=not no_cache,
+        )
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(answer.text)
+    flags = [f"confidence: {answer.confidence:.2f}"]
+    if answer.cached:
+        flags.append("cached: true")
+    if answer.verified:
+        flags.append("verified: true")
+    if answer.escalations_used:
+        flags.append(f"escalations: {', '.join(answer.escalations_used)}")
+    if answer.budget_stopped:
+        flags.append("stopped at token budget")
+    if answer.deadline_stopped:
+        flags.append("stopped at time budget")
+    print(f"\n({' | '.join(flags)})")
+    if answer.frames:
+        print("Frames:")
+        for path in answer.frames[:max_frames]:
+            print(f"- `{path}`")
+    print(f"~{answer.tokens_saved_estimate} tokens saved vs raw-frame injection")
+
+
+@app.command()
+def freshness(
+    video: str = typer.Argument(..., help="video_id or the original source URL/path."),
+) -> None:
+    """Say whether the indexed evidence still describes what the source holds.
+
+    Four answers, all of them real: fresh, stale, refresh_required,
+    freshness_unknown. The last one means the check could not be made — a
+    remote source nobody went to the network for, or a row indexed before
+    content digests existed — and it is reported rather than glossed over.
+    """
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.index.store import check_freshness, source_revisions
+
+    try:
+        state = check_freshness(video)
+        state["revisions"] = source_revisions(video)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(json.dumps(state, indent=2, ensure_ascii=False))
+
+
+@app.command()
+def plan(
+    frames: int = typer.Option(0, "--frames", help="Frames this run would send."),
+    tier: str = typer.Option("strong", "--tier", help="cheap | strong."),
+) -> None:
+    """Print the effective policy and what a run would send, before it runs."""
+    from watch_skill.config import get_settings
+    from watch_skill.policy import execution_plan
+
+    settings = get_settings()
+    provider = (settings.vision_cheap_provider if tier == "cheap"
+                else settings.vision_strong_provider)
+    model = (settings.vision_cheap_model if tier == "cheap"
+             else settings.vision_strong_model)
+    print(json.dumps(
+        execution_plan(phase=f"vision.{tier}", provider=provider, model=model,
+                       frames=frames),
+        indent=2, ensure_ascii=False,
+    ))
+
+
+models_app = typer.Typer(help="Local model cache: inspect and bootstrap.")
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("status")
+def models_status_cmd() -> None:
+    """What this machine could run, and what is already downloaded."""
+    from watch_skill.models.bootstrap import preflight, receipt
+
+    payload = preflight().to_dict()
+    payload["receipt"] = receipt()
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@models_app.command("bootstrap-vlm")
+def models_bootstrap_vlm_cmd(
+    force: bool = typer.Option(False, "--force", help="Re-download if present."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Check only."),
+) -> None:
+    """Download the local vision model. Explicit, opt-in, one model.
+
+    Nothing else in Watch Skill downloads a model. This refuses rather than
+    fills the disk: a half-downloaded model on a full disk is worse than none.
+    """
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.models.bootstrap import bootstrap
+
+    try:
+        print(json.dumps(bootstrap(force=force, dry_run=dry_run), indent=2))
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+
+
+live_app = typer.Typer(help="Watch something as it happens.")
+app.add_typer(live_app, name="live")
+
+
+@app.command("capture-capabilities")
+def capture_capabilities_cmd() -> None:
+    """What this machine can actually record, and how each answer was checked."""
+    from watch_skill.live import capability_matrix
+
+    print(json.dumps(capability_matrix(), indent=2, ensure_ascii=False))
+
+
+@live_app.command("start")
+def live_start_cmd(
+    target: str = typer.Argument(
+        ..., help="File path (replayed live), stream URL, or page URL for --kind browser."),
+    kind: str = typer.Option("file_replay", "--kind",
+                             help="file_replay | stream | browser | window"),
+    profile: str = typer.Option("local-lite", "--profile"),
+    fps: float = typer.Option(2.0, "--fps", help="Analysis frame rate."),
+    buffer_seconds: float = typer.Option(120.0, "--buffer"),
+    follow: bool = typer.Option(False, "--follow", help="Stream events until it ends."),
+    allow_local: bool = typer.Option(
+        False, "--allow-local",
+        help="Let a browser session open loopback URLs — your own dev server. "
+             "Off by default; cloud metadata endpoints stay refused either way."),
+    allowed_host: list[str] = typer.Option(
+        [], "--allowed-host",
+        help="Restrict a browser session to these hosts. Repeatable."),
+) -> None:
+    """Start a live session. --follow prints events as they happen."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.live import observe, start_live, stop_live
+
+    try:
+        session = start_live(target, kind=kind, profile=profile, fps=fps,
+                             buffer_seconds=buffer_seconds,
+                             allow_local=allow_local,
+                             allowed_hosts=list(allowed_host) or None)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+
+    if not follow:
+        print(json.dumps(session.to_public(), indent=2, ensure_ascii=False))
+        return
+
+    cursor = ""
+    try:
+        while True:
+            batch = observe(session.session_id, cursor=cursor or None,
+                            timeout_seconds=2.0)
+            for event in batch["events"]:
+                print(f"{event['media_ts']:8.2f}s  {event['type']:<22} "
+                      f"{event['summary']}")
+            cursor = batch["next_cursor"]
+            if batch["state"] not in ("running", "starting", "paused"):
+                break
+    except KeyboardInterrupt:
+        stop_live(session.session_id, reason="interrupted by operator")
+        print("\nstopped.")
+
+
+@live_app.command("observe")
+def live_observe_cmd(
+    session_id: str = typer.Argument(...),
+    cursor: str = typer.Option("", "--cursor"),
+    limit: int = typer.Option(50, "--limit"),
+    wait: float = typer.Option(0.0, "--wait", help="Long-poll seconds."),
+) -> None:
+    """Read events after a cursor. Repeating a cursor is idempotent."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.live import observe
+
+    try:
+        print(json.dumps(observe(session_id, cursor=cursor or None, limit=limit,
+                                 timeout_seconds=wait), indent=2, ensure_ascii=False))
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+
+
+@live_app.command("ask")
+def live_ask_cmd(
+    session_id: str = typer.Argument(...),
+    question: str = typer.Argument(...),
+    scope: str = typer.Option("recent", "--scope", help="now | recent | session"),
+    seconds: float = typer.Option(30.0, "--seconds"),
+) -> None:
+    """Ask what is happening, answered with media timestamps."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.live import ask_live
+
+    try:
+        print(json.dumps(ask_live(session_id, question, scope=scope, seconds=seconds),
+                         indent=2, ensure_ascii=False))
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+
+
+@live_app.command("aligned")
+def live_aligned_cmd(
+    session_id: str = typer.Argument(...),
+    media_ts: float = typer.Argument(..., help="The moment to anchor on."),
+    window: float = typer.Option(2.0, "--window"),
+) -> None:
+    """What every stream observed around one moment."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.live import aligned_evidence
+
+    try:
+        payload = aligned_evidence(session_id, media_ts, window=window)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@live_app.command("timeline")
+def live_timeline_cmd(
+    session_id: str = typer.Argument(...),
+    window: float = typer.Option(2.0, "--window"),
+) -> None:
+    """A correlated account of the session: observation and inference, apart."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.live.fusion import fuse_session
+
+    try:
+        payload = fuse_session(session_id, window=window)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@live_app.command("status")
+def live_status_cmd(session_id: str = typer.Argument("")) -> None:
+    """One session's health, or every live session on this machine."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.live import list_live, status
+
+    try:
+        payload = status(session_id) if session_id else {"sessions": list_live()}
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@live_app.command("stop")
+def live_stop_cmd(
+    session_id: str = typer.Argument(...),
+    finalize: bool = typer.Option(True, "--finalize/--no-finalize"),
+) -> None:
+    """Stop a session; finalize turns its pinned evidence into indexed memory."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.live import stop_live
+    from watch_skill.live.finalize import finalize_session
+
+    try:
+        payload = stop_live(session_id)
+        if finalize:
+            payload["finalized_video_id"] = finalize_session(session_id)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+jobs_app = typer.Typer(help="Durable background jobs: submit, watch, cancel, drain.")
+app.add_typer(jobs_app, name="jobs")
+
+
+@jobs_app.command("list")
+def jobs_list_cmd(
+    state: str = typer.Option("", "--state", help="queued|running|succeeded|failed|cancelled"),
+    limit: int = typer.Option(25, "--limit"),
+) -> None:
+    """Every durable job on this machine, newest first."""
+    from watch_skill import jobs
+
+    rows = jobs.list_jobs(state=state or None, limit=limit)
+    print(json.dumps([job.to_dict() for job in rows], indent=2, ensure_ascii=False))
+
+
+@jobs_app.command("status")
+def jobs_status_cmd(
+    job_id: str = typer.Argument(...),
+    events: bool = typer.Option(False, "--events", help="Include the append-only log."),
+) -> None:
+    """One job's state, and optionally everything that happened to it."""
+    from watch_skill import jobs
+    from watch_skill.errors import WatchSkillError
+
+    try:
+        job = jobs.get(job_id)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    payload = job.to_dict()
+    if events:
+        payload["events"] = [e.model_dump(mode="json") for e in jobs.events(job_id)]
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@jobs_app.command("cancel")
+def jobs_cancel_cmd(job_id: str = typer.Argument(...)) -> None:
+    """Ask a job to stop. Queued stops now; running stops at its next checkpoint."""
+    from watch_skill import jobs
+    from watch_skill.errors import WatchSkillError
+
+    try:
+        job = jobs.cancel(job_id)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(json.dumps(job.to_dict(), indent=2, ensure_ascii=False))
+
+
+@jobs_app.command("worker")
+def jobs_worker_cmd(
+    kinds: list[str] = typer.Option(None, "--kind", help="Restrict to these job kinds."),
+    max_jobs: int = typer.Option(0, "--max-jobs", help="Exit after N jobs (0 = forever)."),
+    idle_exit: bool = typer.Option(False, "--idle-exit", help="Exit when the queue empties."),
+) -> None:
+    """Drain the durable queue in this process.
+
+    Any number of workers on a machine may run at once — a job is claimed
+    under a lease, so exactly one of them gets each job.
+    """
+    from watch_skill.jobs.worker import Worker
+
+    worker = Worker(kinds=list(kinds) if kinds else None)
+    completed = worker.run_forever(max_jobs=max_jobs or None, idle_exit=idle_exit)
+    print(json.dumps({"owner": worker.owner, "completed": completed}, indent=2))
+
+
+@jobs_app.command("recover")
+def jobs_recover_cmd() -> None:
+    """Re-queue jobs whose worker died. Runs automatically before every claim."""
+    from watch_skill import jobs
+
+    print(json.dumps({"recovered": jobs.recover_stale_leases()}, indent=2))
+
+
+verify_app = typer.Typer(help="Deterministic verification contracts and evidence.")
+app.add_typer(verify_app, name="verify")
+
+
+@verify_app.command("run")
+def verify_run_cmd(
+    contract_path: Path = typer.Argument(..., help="JSON file holding the contract."),
+    working_dir: Path = typer.Option(Path("."), "--dir", help="Bounded working directory."),
+    in_process: bool = typer.Option(
+        False, "--in-process",
+        help="Run checks here instead of an isolated child process (weaker assurance).",
+    ),
+) -> None:
+    """Freeze a contract if needed, run its checks, write a bound evidence bundle."""
+    from pydantic import ValidationError
+
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.verify import VerificationContract, verify_run
+
+    try:
+        # utf-8-sig: Notepad, PowerShell's Set-Content, and Excel all write a
+        # BOM, and a contract is a file a human authors on whatever they have.
+        contract = VerificationContract.model_validate_json(
+            contract_path.read_text(encoding="utf-8-sig")
+        )
+    except (OSError, ValidationError) as exc:
+        print(json.dumps({
+            "error": "verify.contract_unreadable",
+            "message": f"could not read a contract from {contract_path}",
+            "fix": "check the file is JSON with `contract_id`, `title`, and a "
+                   "`checks` list; `watch-skill verify checks` lists the types",
+            "details": {"reason": str(exc)[:600]},
+        }, indent=2))
+        raise typer.Exit(code=1) from None
+    try:
+        if not contract.frozen:
+            contract = contract.freeze(created_by="cli")
+        bundle, attestation = verify_run(
+            contract,
+            working_dir=working_dir,
+            # Read off the contract, never off a flag. A permission granted at
+            # the command line would not be covered by the digest, so a run
+            # could reach somewhere the frozen contract never agreed to.
+            allowed_origins=list(contract.allowed_origins),
+            isolated=not in_process,
+        )
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(json.dumps({
+        "run_id": bundle.run_id,
+        "verdict": bundle.verdict,
+        "assurance": bundle.assurance,
+        "limitations": bundle.limitations,
+        "signature_status": attestation.signature_status,
+        "checks": [
+            {"id": r.check_id, "status": r.status.value, "required": r.required,
+             "summary": r.summary}
+            for r in bundle.check_results
+        ],
+    }, indent=2, ensure_ascii=False))
+    raise typer.Exit(code=0 if bundle.verdict == "pass" else 1)
+
+
+@verify_app.command("show")
+def verify_show_cmd(run_id: str = typer.Argument(...)) -> None:
+    """Re-read a recorded run, re-checking its attestation on the way out."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.verify import load_run
+
+    try:
+        _, bundle, attestation = load_run(run_id)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    payload = bundle.model_dump(mode="json")
+    payload["attestation"] = attestation.model_dump(mode="json")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@verify_app.command("list")
+def verify_list_cmd() -> None:
+    """Every verification run recorded on this machine, newest first."""
+    from watch_skill.verify import list_runs
+
+    print(json.dumps(list_runs(), indent=2, ensure_ascii=False))
+
+
+@verify_app.command("checks")
+def verify_checks_cmd() -> None:
+    """The check types this build can actually run."""
+    from watch_skill.verify import SUPPORTED_CHECK_TYPES
+
+    print(json.dumps(list(SUPPORTED_CHECK_TYPES), indent=2))
+
+
+@app.command()
+def forget(
+    video: str = typer.Argument(..., help="video_id or original source to remove from the index."),
+) -> None:
+    """Forget one video: its index rows, cached answers, and frames dir."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.index.store import forget_video
+
+    try:
+        row = forget_video(video)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(f"forgotten: {row['id']} — {row['title'] or row['source']}")
+
+
+@app.command()
+def stats(
+    cost: bool = typer.Option(False, "--cost", help="Lifetime spend split by source + estimated $."),
+    disk: bool = typer.Option(
+        False, "--disk", help="Where the index's disk went, by video, largest first."
+    ),
+    top: int = typer.Option(10, "--top", help="How many videos to list with --disk."),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Lifetime token savings and answer counts."""
+    if disk:
+        from watch_skill.index.usage import index_usage, render_usage
+
+        usage = index_usage(top=top if top > 0 else None)
+        print(json.dumps(usage.to_dict(), indent=2) if as_json else render_usage(usage))
+        return
+
+    from watch_skill.answer.cache import lifetime_stats
+
+    data = lifetime_stats()
+    print(f"answers served : {data['answers_count']}")
+    print(f"tokens saved   : ~{data['tokens_saved_total']:,} vs raw-frame injection")
+    if data.get("library_answers_count"):
+        print(f"library syntheses    : {data['library_answers_count']}")
+        print(f"library tokens saved : ~{data['library_tokens_saved']:,}")
+    if cost:
+        from watch_skill.answer.cache import spend_stats
+        from watch_skill.vision.registry import price_table
+
+        spend = spend_stats()
+        print("\nlifetime spend by source (estimated tokens):")
+        print(f"  cache hits (free)  : {spend['cache_hits']}")
+        print(f"  text-first         : ~{spend['text_first']:,}")
+        print(f"  local escalation   : ~{spend['local_escalation']:,}")
+        print(f"  vision calls       : ~{spend['vision_call']:,}")
+        print(f"  response frames    : ~{spend['response_frames']:,}")
+        print(f"  cloud spend        : ~${spend['usd_spent_total']:.4f}")
+        print(f"  (prices as of {price_table()['as_of']} — src/watch_skill/vision/prices.json)")
+
+
+@app.command()
+def notes(
+    video: str = typer.Argument(..., help="video_id or the source you watched."),
+    write: Path | None = typer.Option(
+        None, "--write", help="Write the markdown here instead of printing it."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit the structured document."),
+) -> None:
+    """Write up an indexed video as readable notes, every line timestamped.
+
+    Chapters, what was said, what was on screen, and the frames to prove it —
+    assembled from the index rather than generated, so every statement in the
+    document can be checked against the second it came from.
+    """
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.extract.notes import build_notes, render_notes
+
+    try:
+        document = build_notes(video)
+    except WatchSkillError as exc:
+        _console.print(f"[red]error:[/red] {_plain(exc)}")
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+
+    if as_json:
+        print(json.dumps(document.to_dict(), indent=2, ensure_ascii=False))
+        return
+    markdown = render_notes(
+        document, frames_relative_to=write.parent if write is not None else None
+    )
+    if write is not None:
+        write.parent.mkdir(parents=True, exist_ok=True)
+        write.write_text(markdown, encoding="utf-8")
+        print(f"written: {write}")
+    else:
+        print(markdown)
+
+
+bench_app = typer.Typer(help="Benchmarks with receipts (measured on this machine).")
+app.add_typer(bench_app, name="bench")
+
+
+@bench_app.command("perception")
+def bench_perception_cmd(
+    fixtures: Path = typer.Option(
+        Path("benchmarks/perception/fixtures"), "--fixtures",
+        help="Committed fixture directory (images + fixtures.json).",
+    ),
+    vision: bool = typer.Option(False, "--vision", help="Also bench the cheap-tier vision provider."),
+    write: Path | None = typer.Option(None, "--write", help="Write the markdown report here."),
+) -> None:
+    """Char-hit rate, latency, peak RSS per OCR backend over the fixture set."""
+    from watch_skill.bench import bench_perception
+
+    if not (fixtures / "fixtures.json").is_file():
+        print(f"no fixtures at {fixtures} — run benchmarks/perception/make_fixtures.py first")
+        raise typer.Exit(code=1)
+    report, _ = bench_perception(fixtures, include_vision=vision)
+    print(report)
+    if write is not None:
+        write.write_text(report + "\n", encoding="utf-8")
+        print(f"\nwritten: {write}")
+
+
+@bench_app.command("providers")
+def bench_providers_cmd(
+    fixtures: Path = typer.Option(
+        Path("benchmarks/perception/fixtures"), "--fixtures",
+        help="Committed fixture directory (images + fixtures.json).",
+    ),
+    provider: list[str] = typer.Option(
+        None, "--provider", help="Limit to these providers (repeatable). Default: every configured one."
+    ),
+    model: str | None = typer.Option(
+        None, "--model", help="One model for every provider, instead of each one's default."
+    ),
+    write: Path | None = typer.Option(None, "--write", help="Write the markdown report here."),
+) -> None:
+    """Read the same frames with every provider you hold a key for.
+
+    Sixteen providers is a menu; this is how you pick one. Identical inputs,
+    the same char-hit metric, and cost from each provider's own reported
+    tokens — never an estimate.
+    """
+    from watch_skill.bench.providers import bench_providers, render_markdown
+
+    if not (fixtures / "fixtures.json").is_file():
+        print(f"no fixtures at {fixtures} — run benchmarks/perception/make_fixtures.py first")
+        raise typer.Exit(code=1)
+
+    model_for = None
+    if model:
+        from watch_skill.vision.registry import PROVIDERS
+
+        model_for = dict.fromkeys(PROVIDERS, model)
+
+    report = bench_providers(fixtures, providers=list(provider) if provider else None, model_for=model_for)
+    markdown = render_markdown(report)
+    print(markdown)
+    if write is not None:
+        write.write_text(markdown, encoding="utf-8")
+        print(f"written: {write}")
+
+
+def _write_chart(result, directory: Path) -> None:
+    """Draw the comparison chart from the same result the report was rendered
+    from, so the picture can never drift from the table beside it."""
+    from watch_skill.bench.video_backends.chart import render_chart
+    from watch_skill.bench.video_backends.comparison import build_axes
+
+    axes = build_axes(result.to_dict())
+    if not axes:
+        return
+    destination = directory / "comparison.svg"
+    destination.write_text(
+        render_chart(axes, title="Watch Skill vs Adversal MCP 0.1.4 — measured axes"),
+        encoding="utf-8",
+    )
+    print(f"chart:   {destination}")
+
+
+@bench_app.command("video-backend")
+def bench_video_backend_cmd(
+    backend: str = typer.Argument("adversal", help="Which external backend to evaluate."),
+    fixtures: Path = typer.Option(
+        Path("benchmarks/video_backends/fixtures"), "--fixtures",
+        help="Ground-truth directory (manifest.json + generated media).",
+    ),
+    adversal_cli: str | None = typer.Option(
+        None, "--adversal-cli", help="Path to the adversal-cli executable."
+    ),
+    adversal_python: str | None = typer.Option(
+        None, "--adversal-python",
+        help="Interpreter adversal-cli is installed into, used to read its version.",
+    ),
+    runs: int = typer.Option(3, "--runs", help="Repeat the frame path this many times."),
+    baseline: bool = typer.Option(
+        True, "--baseline/--no-baseline", help="Also score Watch Skill on the same probes."
+    ),
+    poll_attempts: int = typer.Option(
+        0, "--poll", help="Poll a submitted job this many times before giving up."
+    ),
+    real_media: list[Path] = typer.Option(
+        None, "--real-media",
+        help="Also measure against a real local video (repeatable). No ground "
+             "truth is authored for it; the file supplies its own.",
+    ),
+    real_media_url: list[str] = typer.Option(
+        None, "--real-media-url",
+        help="Also exercise the URL acquisition path (repeatable). Needs a "
+             "--real-media reference copy to localize returned frames against.",
+    ),
+    real_probes: int = typer.Option(
+        30, "--real-probes", help="Timestamps to request per real video."
+    ),
+    analysis: list[str] = typer.Option(
+        None, "--analysis",
+        help="SOURCE=PATH — score the provider's written analysis for a video "
+             "Watch Skill has also indexed (repeatable).",
+    ),
+    call_timeout: float = typer.Option(
+        900.0, "--call-timeout",
+        help="Give up on one backend call after this many seconds. A tool that "
+             "never returns is a result; waiting forever is not.",
+    ),
+    work_dir: Path | None = typer.Option(
+        None, "--work-dir", help="Where to put downloaded frames (default: a temp dir)."
+    ),
+    raw: Path | None = typer.Option(
+        None, "--raw", help="Write the sanitized machine-readable result here."
+    ),
+    write: Path | None = typer.Option(None, "--write", help="Write the markdown report here."),
+    from_raw: Path | None = typer.Option(
+        None, "--from-raw",
+        help="Re-render the report from a previous run's raw JSON. Touches no "
+             "backend — the point is that every number is reproducible from it.",
+    ),
+) -> None:
+    """Measure an external video backend against Watch Skill's evidence model.
+
+    Frames, timestamps, ordering, transcripts and failure semantics against a
+    generated fixture whose ground truth is exact. Nothing is estimated: a
+    path that needs credentials this machine does not have is reported as not
+    measured, never as a zero.
+    """
+    import tempfile
+
+    from watch_skill.bench.video_backends import report as vb_report
+    from watch_skill.bench.video_backends import verdict as vb_verdict
+    from watch_skill.bench.video_backends.runner import (
+        evidence_matrix,
+        run_benchmark,
+        write_raw,
+    )
+
+    if backend != "adversal":
+        print(f"unknown backend {backend!r} — only 'adversal' is implemented")
+        raise typer.Exit(code=2)
+
+    if from_raw is not None:
+        from watch_skill.bench.video_backends.runner import result_from_raw
+
+        result = result_from_raw(json.loads(from_raw.read_text(encoding="utf-8")))
+        data = result.to_dict()
+        rows = evidence_matrix({
+            "frames_measured": bool(data.get("frame_identity")),
+            "pipeline_completed": bool(data.get("pipeline", {}).get("completed")),
+        })
+        gates = vb_verdict.evaluate(data, rows)
+        decision, reasons = vb_verdict.decide(gates)
+        markdown = vb_report.render(
+            result, verdict=decision, verdict_reasons=reasons, gates=gates
+        )
+        if write is not None:
+            write.parent.mkdir(parents=True, exist_ok=True)
+            write.write_text(markdown, encoding="utf-8")
+            print(f"written: {write}")
+            _write_chart(result, write.parent)
+        else:
+            print(markdown)
+        print(f"verdict: {decision} (re-rendered from {from_raw})")
+        return
+    if not (fixtures / "manifest.json").is_file():
+        print(
+            f"no ground truth at {fixtures} — run "
+            "benchmarks/video_backends/make_fixtures.py first"
+        )
+        raise typer.Exit(code=1)
+
+    from watch_skill.bench.video_backends.adapters.adversal_mcp import AdversalMcpAdapter
+
+    adapter = AdversalMcpAdapter(
+        executable=adversal_cli, python=adversal_python, timeout=call_timeout
+    )
+
+    with tempfile.TemporaryDirectory(prefix="ws-video-backend-") as tmp:
+        target = work_dir if work_dir is not None else Path(tmp)
+        result = run_benchmark(
+            fixtures, adapter, work_dir=target, repeats=runs,
+            include_baseline=baseline, poll_attempts=poll_attempts,
+            real_media=[Path(p) for p in (real_media or [])],
+            real_media_urls=list(real_media_url or []),
+            real_media_probes=real_probes,
+            analysis_documents=dict(
+                pair.split("=", 1) for pair in (analysis or []) if "=" in pair
+            ) or None,
+        )
+        data = result.to_dict()
+        rows = evidence_matrix({
+            "frames_measured": bool(data.get("frame_identity")),
+            "pipeline_completed": bool(data.get("pipeline", {}).get("completed")),
+        })
+        gates = vb_verdict.evaluate(data, rows)
+        decision, reasons = vb_verdict.decide(gates)
+        markdown = vb_report.render(
+            result, verdict=decision, verdict_reasons=reasons, gates=gates
+        )
+
+        if raw is not None:
+            write_raw(result, raw)
+            print(f"raw: {raw}")
+        if write is not None:
+            write.parent.mkdir(parents=True, exist_ok=True)
+            write.write_text(markdown, encoding="utf-8")
+            print(f"written: {write}")
+            _write_chart(result, write.parent)
+        if write is None and raw is None:
+            print(markdown)
+        else:
+            print(f"\nverdict: {decision}")
+
+
+library_app = typer.Typer(help="Cross-video memory: notes, synthesis, overview.")
+app.add_typer(library_app, name="library")
+
+
+@library_app.command("ask")
+def library_ask(
+    question: str = typer.Argument(..., help="A question no single video answers."),
+    k_videos: int = typer.Option(5, "--videos", help="How many videos to consult."),
+) -> None:
+    """Synthesize an answer across ALL indexed videos, with per-video citations."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.library import library_synthesize
+
+    try:
+        answer = library_synthesize(question, k_videos=k_videos)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(answer.text)
+    print(
+        f"\nconfidence: {answer.confidence} | videos consulted: {answer.videos_consulted}"
+        f" | corroborated: {answer.corroborated} | cached: {answer.cached}"
+        f" | ~{answer.tokens_saved_estimate:,} tokens saved"
+    )
+
+
+@library_app.command("overview")
+def library_overview_cmd() -> None:
+    """What the library knows: sizes, note counts, cross-video entities."""
+    from watch_skill.library import library_overview
+
+    print(json.dumps(library_overview(), ensure_ascii=False, indent=2))
+
+
+@library_app.command("rebuild-notes")
+def library_rebuild_notes() -> None:
+    """Distill notes for every already-indexed video (one-time upgrade path
+    for indexes built before the notes layer; new watches distill on their
+    own)."""
+    from watch_skill.index import list_videos
+    from watch_skill.library import distill_notes
+
+    total = 0
+    for row in list_videos():
+        count = distill_notes(row["id"])
+        total += count
+        print(f"{row['id']}  {count:4d} notes  {row['title'] or row['source']}")
+    print(f"\n{total} notes across {len(list_videos())} videos")
+
+
+@app.command("list")
+def list_cmd() -> None:
+    """List indexed videos."""
+    from watch_skill.index import list_videos
+
+    for row in list_videos():
+        try:
+            length = f"{float(row['duration_seconds']):8.1f}s"
+        except (TypeError, ValueError):
+            length = "       ?s"
+        print(f"{row['id']}  {length}  {row['title'] or row['source']}")
+
+
+@app.command()
+def search(query: str = typer.Argument(...)) -> None:
+    """Search across every indexed video."""
+    from watch_skill.index import search_videos
+    from watch_skill.perceive.budget import format_time
+
+    for group in search_videos(query):
+        video = group["video"] or {}
+        print(f"\n## {video.get('title') or video.get('source')} ({video.get('id')})")
+        for hit in group["hits"]:
+            stamp = format_time(hit["timestamp"]) if hit["timestamp"] is not None else "--:--"
+            print(f"- [{stamp}] ({hit['kind']}, {hit['score']:.2f}) {hit['text']}")
+
+
+loop_app = typer.Typer(help="THE LOOP: capture -> critique -> fix -> re-capture.")
+app.add_typer(loop_app, name="loop")
+
+
+def _print_loop_state(state) -> None:
+    from watch_skill.loop.reportfmt import format_loop_state
+
+    print(format_loop_state(state))
+
+
+@app.command()
+def capture(
+    target: str = typer.Argument(..., help="URL, screen:, window:<title>, or video file."),
+    duration: float = typer.Option(10.0, "--duration", help="Recording length in seconds."),
+    script_json: str | None = typer.Option(
+        None, "--script", help="Interaction script as JSON list of steps."
+    ),
+    out_dir: str | None = typer.Option(None, "--out-dir"),
+) -> None:
+    """Record a URL session / the screen / a window to video."""
+    import tempfile
+    from pathlib import Path
+
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.loop import capture as run_capture
+
+    try:
+        script = json.loads(script_json) if script_json else None
+        dest = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="watch-skill-capture-"))
+        result = run_capture(target, dest, script=script, duration_seconds=duration)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(f"captured {result.kind}: {result.video_path}")
+
+
+@loop_app.command("start")
+def loop_start_cmd(
+    target: str = typer.Argument(...),
+    pass_criteria: str = typer.Argument(..., help="Natural-language pass criteria."),
+    script_json: str | None = typer.Option(None, "--script"),
+    max_iterations: int = typer.Option(5, "--max-iterations"),
+    duration: float = typer.Option(8.0, "--duration"),
+) -> None:
+    """Capture + critique the first iteration; prints loop_id and issues."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.loop import loop_start
+
+    try:
+        script = json.loads(script_json) if script_json else None
+        state = loop_start(
+            target, pass_criteria, script=script,
+            max_iterations=max_iterations, duration_seconds=duration,
+        )
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    _print_loop_state(state)
+
+
+@loop_app.command("video-gen")
+def loop_video_gen_cmd(
+    spec: str = typer.Argument(..., help="What the generated video must show."),
+    generator_cmd: str = typer.Argument(..., help="Command that renders the video."),
+    output: str = typer.Option(..., "--output", help="Video file the command writes."),
+    pass_criteria: str | None = typer.Option(None, "--criteria", help="Overrides spec for the critic."),
+    workdir: str | None = typer.Option(None, "--workdir"),
+    max_iterations: int = typer.Option(5, "--max-iterations"),
+    timeout: float = typer.Option(600.0, "--timeout", help="Generator timeout (seconds)."),
+) -> None:
+    """Video-gen loop: run the generator, watch its render, critique vs spec."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.loop import loop_video_gen
+
+    try:
+        state = loop_video_gen(
+            spec, generator_cmd, output, pass_criteria=pass_criteria,
+            workdir=workdir, max_iterations=max_iterations, timeout_seconds=timeout,
+        )
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    _print_loop_state(state)
+
+
+@loop_app.command("game")
+def loop_game_cmd(
+    target: str = typer.Argument(..., help="Canvas game URL, window:<title>, or screen:."),
+    pass_criteria: str = typer.Argument(...),
+    run_cmd: str | None = typer.Option(None, "--run", help="Command that launches the game/sim."),
+    script_json: str | None = typer.Option(None, "--script"),
+    duration: float = typer.Option(10.0, "--duration"),
+    max_iterations: int = typer.Option(5, "--max-iterations"),
+) -> None:
+    """Game/sim loop: record gameplay, critic detects visual glitches."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.loop import loop_game
+
+    try:
+        script = json.loads(script_json) if script_json else None
+        state = loop_game(
+            target, pass_criteria, run_cmd=run_cmd, script=script,
+            duration_seconds=duration, max_iterations=max_iterations,
+        )
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    _print_loop_state(state)
+
+
+@loop_app.command("monitor")
+def loop_monitor_cmd(
+    source: str = typer.Argument(..., help="Folder of videos, or a live capture target."),
+    condition: str = typer.Argument(..., help="What to watch for, in plain language."),
+    interval: float = typer.Option(10.0, "--interval", help="Seconds between live checks."),
+    max_checks: int = typer.Option(10, "--max-checks"),
+    sample_seconds: float = typer.Option(5.0, "--sample-seconds"),
+) -> None:
+    """Watch a source until the condition appears; emits a structured event."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.loop import loop_monitor
+
+    try:
+        result = loop_monitor(
+            source, condition, interval_seconds=interval,
+            max_checks=max_checks, sample_seconds=sample_seconds,
+        )
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+
+
+@loop_app.command("iterate")
+def loop_iterate_cmd(loop_id: str = typer.Argument(...)) -> None:
+    """Re-capture + re-critique after you applied fixes; diffs vs previous."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.loop import loop_iterate
+
+    try:
+        state = loop_iterate(loop_id)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    _print_loop_state(state)
+
+
+@loop_app.command("status")
+def loop_status_cmd(loop_id: str = typer.Argument(...)) -> None:
+    """Show a loop's persisted state."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.loop import loop_status
+
+    try:
+        state = loop_status(loop_id)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    _print_loop_state(state)
+
+
+@loop_app.command("viewer")
+def loop_viewer_cmd(
+    loop_id: str = typer.Argument(...),
+    out: str | None = typer.Option(None, "--out", "-o", help="Output HTML path."),
+) -> None:
+    """Render one loop run as a self-contained page: every iteration, compared.
+
+    The before/after GIF shows that a verdict changed. This shows why — which
+    issue went away, which one appeared, and the frame the critic was looking
+    at when it said so.
+    """
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.loop.viewer import generate_loop_viewer
+
+    try:
+        path = generate_loop_viewer(loop_id, out_path=out)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(f"loop viewer written: {path}")
+
+
+@app.command()
+def setup(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Configure all detected agents without prompting."),
+    only: str | None = typer.Option(None, "--only", help="Comma list of agent keys (e.g. cursor,codex)."),
+) -> None:
+    """Detect installed AI agents and write the MCP config into each one.
+
+    Backs up any existing config file before touching it. From clone to a
+    working /watch in under two minutes.
+    """
+    from watch_skill.health.agents_setup import configure_agent, detect_agents
+
+    wanted = {k.strip() for k in only.split(",")} if only else None
+    targets = [t for t in detect_agents() if t.detected]
+    if wanted is not None:
+        targets = [t for t in targets if t.key in wanted]
+    if not targets:
+        print("No supported agents detected on this machine.")
+        print("Manual configs for every agent: docs/agents/README.md")
+        raise typer.Exit(code=0)
+
+    _console.print("[bold]Detected agents:[/bold]")
+    for t in targets:
+        state = "already configured" if t.configured else "will configure"
+        _console.print(f"  - {_plain(t.label)}  ({state}; {_plain(t.config_path)})")
+    todo = [t for t in targets if not t.configured]
+    if not todo:
+        print("Everything already configured. Restart the agents to pick it up.")
+        raise typer.Exit(code=0)
+    if not yes and not typer.confirm(f"Write MCP config into {len(todo)} agent(s)?", default=True):
+        raise typer.Exit(code=0)
+    for t in todo:
+        changed, message = configure_agent(t)
+        _console.print(
+            ("[green]+[/green] " if changed else "[yellow]=[/yellow] ") + _plain(message))
+    print("\nDone. Restart each agent, then try: \"watch this video ...\" in its chat.")
+
+
+def _make_probe_frame() -> Path:
+    """A tiny labelled frame for the live vision check."""
+    import tempfile
+
+    out = Path(tempfile.gettempdir()) / "watch_skill_vision_probe.png"
+    try:
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGB", (360, 140), (200, 30, 30))
+        ImageDraw.Draw(img).text((20, 55), "WATCH SKILL 2026", fill=(255, 255, 255))
+        img.save(out)
+        return out
+    except Exception:  # noqa: BLE001 — PIL absent: fall back to an ffmpeg color frame
+        import shutil
+        import subprocess
+
+        from watch_skill.config import get_settings
+
+        ff = shutil.which("ffmpeg") or str(get_settings().bin_dir / "ffmpeg.exe")
+        subprocess.run(
+            [ff, "-y", "-f", "lavfi", "-i", "color=c=red:s=360x140:d=1", "-frames:v", "1", str(out)],
+            capture_output=True,
+        )
+        return out
+
+
+def _verify_vision_live() -> None:
+    """Run ONE live describe call so setup proves vision actually works."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.vision.model import get_vision
+
+    img = _make_probe_frame()
+    _console.print("Running a live vision check (this can take a minute on a local model)...")
+    try:
+        descriptions = get_vision("cheap").describe_frames([img])
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    text = (descriptions[0] if descriptions else "").strip()
+    if not text:
+        print("Vision call returned empty output — check the provider/model config.")
+        raise typer.Exit(code=1)
+    # The model's own words, so markup is switched off rather than escaped by
+    # habit: observed content decides nothing about how this terminal renders.
+    _console.print(
+        f"[green]Vision OK[/green] — the model described the probe frame as:\n  "
+        f"{_plain(text)}")
+
+
+@app.command("setup-vision")
+def setup_vision(
+    provider: str = typer.Option(
+        ...,
+        "--provider",
+        help="anthropic | openai | gemini | openrouter | ollama | groq | together | "
+        "fireworks | deepseek | xai | mistral | minimax | moonshot | zai | qwen | custom",
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        help="API key for a cloud provider. Prefer the matching WATCHSKILL_* env var in shared shells.",
+    ),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        help="Override the provider's host: a regional endpoint, a proxy, or — with "
+        "--provider custom — any OpenAI-compatible server (vLLM, LM Studio, LiteLLM).",
+    ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Use one model for both tiers; provider defaults if omitted.",
+    ),
+    cheap_model: str | None = typer.Option(
+        None, "--cheap-model", help="Override the bulk/first-pass model."
+    ),
+    strong_model: str | None = typer.Option(
+        None, "--strong-model", help="Override the verification/critic model."
+    ),
+    pull: bool = typer.Option(True, "--pull/--no-pull", help="For Ollama: pull the model if it is missing."),
+    verify: bool = typer.Option(False, "--verify", help="Run one live vision call to confirm it works."),
+) -> None:
+    """Configure a supported cloud provider or the optional local Ollama path.
+
+    Writes the WATCHSKILL_VISION_* settings into .env (backing it up first).
+    Transcription + search already work with no vision backend at all.
+    """
+    from watch_skill.config import reset_settings
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.health import vision_setup as vs
+
+    provider = provider.lower().strip()
+    if provider in vs.CLOUD_PROVIDER_DEFAULTS:
+        try:
+            env, backup = vs.configure_cloud(
+                provider,
+                api_key or "",
+                cheap_model=cheap_model or model,
+                strong_model=strong_model or model,
+                base_url=base_url,
+            )
+        except WatchSkillError as exc:
+            print(json.dumps(exc.to_dict(), indent=2))
+            raise typer.Exit(code=1) from None
+        note = f" (backup: {backup.name})" if backup else ""
+        _console.print(f"[green]+[/green] {_plain(provider)} configured -> {_plain(env)}{_plain(note)}")
+    elif provider == "ollama":
+        import shutil
+        import subprocess
+
+        chosen = model or vs.recommend_ollama_model()
+        if not vs.ollama_running():
+            print(
+                "Ollama is not running. Install it from https://ollama.com, start it, "
+                "then re-run this command."
+            )
+            raise typer.Exit(code=1)
+        present = vs.ollama_models()
+        base = chosen.split(":")[0]
+        if chosen not in present and not any(m.split(":")[0] == base for m in present):
+            if not pull:
+                print(f"Model {chosen} is not pulled. Run:  ollama pull {chosen}")
+                raise typer.Exit(code=1)
+            ollama = shutil.which("ollama")
+            if not ollama:
+                print(f"`ollama` CLI not on PATH; pull manually:  ollama pull {chosen}")
+                raise typer.Exit(code=1)
+            _console.print(f"Pulling {chosen} (first time only; this can be a large download)...")
+            if subprocess.run([ollama, "pull", chosen]).returncode != 0:
+                print(f"`ollama pull {chosen}` failed.")
+                raise typer.Exit(code=1)
+        env, backup = vs.configure_ollama(model=chosen)
+        note = f" (backup: {backup.name})" if backup else ""
+        _console.print(
+            f"[green]+[/green] Ollama configured ({_plain(chosen)}) -> {_plain(env)}{_plain(note)}")
+    else:
+        supported = " | ".join([*vs.CLOUD_PROVIDER_DEFAULTS, "ollama"])
+        print(f"Unknown provider: {provider!r} (expected {supported}).")
+        raise typer.Exit(code=1)
+
+    reset_settings()  # pick up the freshly written .env
+    if verify:
+        _verify_vision_live()
+    else:
+        _console.print(
+            f"Verify anytime with:  watch-skill setup-vision --provider {provider} --verify"
+        )
+
+
+@app.command()
+def clean(
+    cache: bool = typer.Option(False, "--cache", help="Evict the download cache to its size cap."),
+    all_cache: bool = typer.Option(False, "--all-cache", help="Empty the download cache entirely."),
+    loops: bool = typer.Option(False, "--loops", help="Keep only the 10 most recent loops."),
+    keep_loops: int = typer.Option(10, "--keep-loops", help="How many recent loops to keep."),
+    orphans: bool = typer.Option(False, "--orphans", help="Remove frame dirs for de-indexed videos."),
+    cache_answers: bool = typer.Option(
+        False, "--cache-answers", help="Clear the semantic answer cache."
+    ),
+    everything: bool = typer.Option(False, "--all", help="Cache-to-cap + loops + orphans."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report only; delete nothing."),
+) -> None:
+    """Reclaim disk: bounded cache, bounded loop archives, orphaned frames."""
+    from watch_skill.health.clean import clean_cache, clean_loops, clean_orphan_frames
+
+    if everything:
+        cache = loops = orphans = True
+    if cache_answers:
+        from watch_skill.answer.cache import clear as clear_answers
+
+        removed = 0 if dry_run else clear_answers()
+        print(f"answer cache: {'would clear' if dry_run else 'cleared'} ({removed} rows)")
+        if not (cache or all_cache or loops or orphans):
+            return
+    if not (cache or all_cache or loops or orphans):
+        print(
+            "Nothing selected. Use --all, or any of "
+            "--cache/--all-cache/--loops/--orphans/--cache-answers."
+        )
+        raise typer.Exit(code=1)
+    total = 0
+    for label, enabled, fn in (
+        ("cache", cache or all_cache, lambda: clean_cache(all_entries=all_cache, dry_run=dry_run)),
+        ("loops", loops, lambda: clean_loops(keep=keep_loops, dry_run=dry_run)),
+        ("orphan frames", orphans, lambda: clean_orphan_frames(dry_run=dry_run)),
+    ):
+        if not enabled:
+            continue
+        report = fn()
+        total += report.freed_bytes
+        verb = "would free" if dry_run else "freed"
+        print(f"{label}: {verb} {report.freed_bytes / 1024**2:.1f} MiB "
+              f"({len(report.removed)} removed, {len(report.kept)} kept)")
+    print(f"total {'reclaimable' if dry_run else 'reclaimed'}: {total / 1024**2:.1f} MiB")
+
+
+@app.command()
+def viewer(
+    video: str = typer.Argument(..., help="video_id or original source."),
+    out: str | None = typer.Option(None, "--out", "-o", help="Output HTML path."),
+) -> None:
+    """Render a shareable, self-contained HTML viewer for an analyzed video."""
+    from watch_skill.errors import WatchSkillError
+    from watch_skill.viewer import generate_viewer
+
+    try:
+        path = generate_viewer(video, out_path=out)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(f"viewer written: {path}")
+
+
+@app.command()
+def batch(
+    sources: list[str] = typer.Argument(..., help="Video URLs/paths, folders, or playlist URLs."),
+    limit: int = typer.Option(20, "--limit", help="Max videos to process."),
+) -> None:
+    """Watch + index a whole playlist/folder/list into one searchable memory."""
+    from watch_skill.batch import watch_batch
+    from watch_skill.errors import WatchSkillError
+
+    try:
+        result = watch_batch(list(sources), limit=limit)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    print(result.report())
+    if result.failed and not result.indexed:
+        raise typer.Exit(code=1)
+
+
+extract_app = typer.Typer(help="Structured extraction from the persistent index.")
+app.add_typer(extract_app, name="extract")
+
+
+def _run_extract(fn, *args, **kwargs) -> None:
+    from watch_skill.errors import WatchSkillError
+
+    try:
+        result = fn(*args, **kwargs)
+    except WatchSkillError as exc:
+        print(json.dumps(exc.to_dict(), indent=2))
+        raise typer.Exit(code=1) from None
+    if isinstance(result, list):
+        payload = [item.to_dict() for item in result]
+    else:
+        payload = result.to_dict()
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@extract_app.command("chapters")
+def extract_chapters_cmd(video: str = typer.Argument(..., help="video_id or source.")) -> None:
+    """Titled chapters with timestamps (scene changes + transcript shifts)."""
+    from watch_skill.extract import extract_chapters
+
+    _run_extract(extract_chapters, video)
+
+
+@extract_app.command("bug-report")
+def extract_bug_report_cmd(video: str = typer.Argument(...)) -> None:
+    """Locate the first on-screen error: timestamp, frame, text, repro steps."""
+    from watch_skill.extract import extract_bug_report
+
+    _run_extract(extract_bug_report, video)
+
+
+@extract_app.command("hook")
+def analyze_hook_cmd(
+    video: str = typer.Argument(...),
+    seconds: float = typer.Option(15.0, "--seconds", help="Opening window to score."),
+) -> None:
+    """Score the first N seconds as a hook (pacing, trigger, visuals, text)."""
+    from watch_skill.extract import analyze_hook
+
+    _run_extract(analyze_hook, video, window_seconds=seconds)
+
+
+lessons_app = typer.Typer(help="The local lessons store: learn from reported mistakes.")
+app.add_typer(lessons_app, name="lessons")
+
+
+@lessons_app.command("add")
+def lessons_add(
+    video: str = typer.Argument(..., help="video_id or original source."),
+    question: str = typer.Argument(...),
+    wrong: str = typer.Argument(..., help="The wrong answer that was given."),
+    correction: str = typer.Argument(..., help="What the correct answer actually is."),
+    session: str | None = typer.Option(None, "--session", help="Session id to group under."),
+    no_reask: bool = typer.Option(False, "--no-reask", help="Skip the immediate re-ask check."),
+) -> None:
+    """Report a wrong answer + its correction; the system learns from it."""
+    from watch_skill.lessons import report_mistake
+
+    outcome = report_mistake(
+        video, question, wrong, correction,
+        agent="cli", session_id=session, reask=not no_reask,
+    )
+    print(json.dumps(outcome, ensure_ascii=False, indent=2))
+
+
+@lessons_app.command("list")
+def lessons_list(
+    session: str | None = typer.Option(None, "--session"),
+    limit: int = typer.Option(20, "--limit"),
+) -> None:
+    """List stored lessons (newest first)."""
+    from watch_skill.lessons import list_lessons
+
+    rows = list_lessons(session_id=session, limit=limit)
+    if not rows:
+        print("No lessons stored yet — report one with `watch-skill lessons add`.")
+        return
+    for row in rows:
+        mark = "✓" if row["validated"] else " "
+        print(f"[{mark}] #{row['id']} {row['error_class']:<15} ({row['content_type']}) "
+              f"{row['guidance'][:90]}")
+
+
+@lessons_app.command("rm")
+def lessons_rm(
+    ids: list[int] = typer.Argument(None, help="Lesson ids to remove."),
+    session: str | None = typer.Option(None, "--session", help="Remove a whole session."),
+) -> None:
+    """Remove lessons by id or by session."""
+    from watch_skill.lessons import remove_lessons
+
+    removed = remove_lessons(ids=list(ids) if ids else None, session_id=session)
+    print(f"removed {removed} lesson(s)")
+
+
+@lessons_app.command("export-evals")
+def lessons_export_evals() -> None:
+    """Convert every lesson into a replayable eval case."""
+    from watch_skill.lessons import export_evals
+
+    print(f"eval cases written to {export_evals()}")
+
+
+@lessons_app.command("eval")
+def lessons_eval(
+    report: bool = typer.Option(True, "--report/--no-report", help="Print per-lesson classification."),
+    prune: bool = typer.Option(False, "--prune", help="Delete the lessons classified prunable."),
+) -> None:
+    """Replay every lesson against the CURRENT pipeline and classify each:
+    still-effective (load-bearing), prunable (pipeline answers correctly
+    without it), or regressed (the lesson no longer protects)."""
+    from watch_skill.lessons.evals import eval_report, prune_lessons
+
+    outcome = eval_report()
+    counts = outcome["counts"]
+    print(
+        f"lessons: {counts['still_effective']} still effective, "
+        f"{counts['prunable']} prunable, {counts['regressed']} regressed, "
+        f"{counts['skipped']} skipped (source video gone)"
+    )
+    if report:
+        for entry in outcome["lessons"]:
+            marker = {"still_effective": "KEEP ", "prunable": "PRUNE",
+                      "regressed": "LOOK ", "skipped": "SKIP "}[entry["state"]]
+            detail = entry.get("question") or entry.get("reason") or entry.get("error", "")
+            print(f"  {marker} #{entry['lesson_id']}  {detail}")
+    if prune:
+        removed = prune_lessons(outcome)
+        print(f"pruned {removed} lesson(s)")
+
+
+evals_app = typer.Typer(help="Replay lesson-derived evals against the current system.")
+app.add_typer(evals_app, name="evals")
+
+
+@evals_app.command("run")
+def evals_run() -> None:
+    """Replay the eval suite; pass-rate rising over time = it learns."""
+    from watch_skill.lessons import run_evals
+
+    result = run_evals()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result["total"] and result["pass_rate"] is not None:
+        print(f"\npass rate: {result['pass_rate']:.0%} "
+              f"({result['passed']}/{result['total']}, {result['skipped']} skipped)")
+
+
+profiles_app = typer.Typer(help="Adaptive per-content-type profiles learned from lessons.")
+app.add_typer(profiles_app, name="profiles")
+
+
+@profiles_app.command("show")
+def profiles_show() -> None:
+    """Show the active adaptive profiles (data, not code)."""
+    from watch_skill.lessons import show_profiles
+
+    rows = show_profiles()
+    if not rows:
+        print("No profiles earned yet — they aggregate from lesson statistics.")
+        return
+    print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+
+
+@profiles_app.command("reset")
+def profiles_reset() -> None:
+    """Drop all adaptive profiles (lessons stay)."""
+    from watch_skill.lessons import reset_profiles
+
+    print(f"reset {reset_profiles()} profile(s)")
+
+
+@app.command()
+def version() -> None:
+    """Print the Watch Skill version."""
+    from watch_skill import __version__
+
+    print(__version__)
+
+
+def _print_version(value: bool) -> None:
+    """Callback for the top-level --version flag."""
+    if value:
+        from watch_skill import __version__
+
+        print(__version__)
+        raise typer.Exit()
+
+
+# `watch-skill version` has always worked, but `--version` is what people
+# type first — and what packaging smoke tests reach for.
+@app.callback()
+def _main(
+    _version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        help="Print the Watch Skill version and exit.",
+        callback=_print_version,
+        is_eager=True,
+    ),
+) -> None:
+    """Give any agent a video input: watch, index, ask, and iterate."""
+
+
+if __name__ == "__main__":
+    sys.exit(app())

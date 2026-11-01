@@ -1,0 +1,5 @@
+./vendor/watch-skill
+httpx==0.28.1
+pydantic==2.13.5
+python-docx==1.2.0
+Pillow==12.3.0
