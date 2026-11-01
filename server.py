@@ -5,13 +5,14 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse,parse_qs,quote
 import httpx
+from segments import plan_segments, segment_prompt, merge_segments
 from protocol import PROMPT,Extraction
 from evidence import validate_v2
 
 ROOT=Path(__file__).resolve().parent
 DATA=Path(os.environ.get('VIDEO_MANUAL_DATA_DIR',str(ROOT/'data'))).resolve()
 DATA.mkdir(parents=True,exist_ok=True)
-MODEL='gpt-6.1-terra';MAX_OUTPUT=8192;MAX_FRAMES=120;MAX_BYTES=300*1024*1024
+MODEL='gpt-6.1-terra';MAX_OUTPUT=8192
 TOKEN=secrets.token_urlsafe(32);ORIGIN='';STATE_LOCK=threading.RLock();WORK=threading.Lock()
 # Optional integration points are injected in memory by a trusted local launcher.
 external_reserve=None;external_settle=None
@@ -21,6 +22,28 @@ def write(p,x):
     p.parent.mkdir(parents=True,exist_ok=True)
     tmp=p.with_suffix(p.suffix+'.tmp');tmp.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8');tmp.replace(p)
 def digest(b):return hashlib.sha256(b).hexdigest()
+def file_digest(path):
+    h=hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
+    return h.hexdigest()
+
+def run_media(jid,cmd,duration,label):
+    """Drain progress continuously; no whole-file buffering or fixed time cutoff."""
+    p=jobdir(jid)
+    with (p/'media-error.log').open('wb') as err:
+        proc=subprocess.Popen(cmd+['-progress','pipe:1','-nostats'],stdout=subprocess.PIPE,stderr=err,stdin=subprocess.DEVNULL,text=True,encoding='utf-8',errors='replace')
+        try:
+            for line in proc.stdout:
+                k,_,v=line.strip().partition('=')
+                if k=='out_time_us' and v.lstrip('-').isdigit():
+                    fraction=min(1,max(0,int(v)/1e6/duration))
+                    change(jid,message=f'{label} {fraction:.0%}',progress=fraction)
+            code=proc.wait()
+        finally:
+            if proc.poll() is None:proc.kill();proc.wait()
+    if code:raise ValueError(label+'に失敗しました。入力動画とディスク空き容量を確認してください。')
+
 def utc():return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def jobdir(jid):
     if not re.fullmatch(r'[a-f0-9]{32}',jid):raise ValueError('作業IDが正しくありません。')
@@ -67,32 +90,44 @@ def prepare(jid):
     j=load_job(jid);p=jobdir(jid);watch,probe,ffmpeg=watch_functions();src=p/j['source_file']
     meta=probe(src);duration=meta.duration_seconds
     if not math.isfinite(duration) or duration<=0:raise ValueError('動画の長さを確認できませんでした。')
-    count=math.ceil(duration/j['interval'])
-    if duration>240 or count>MAX_FRAMES:raise ValueError('画像数が上限120枚を超えます。0.5秒間隔は約1分、1秒は約2分、2秒は約4分までです。動画を短くするか抽出間隔を変更してください。')
+    count=max(1,math.ceil(duration/j['interval']))
     change(jid,phase='extracting',message='動画から根拠画像を抽出しています。',duration=duration)
-    times=[round(i*j['interval'],3) for i in range(count) if i*j['interval']<duration-.08]
-    result=watch(str(src),run_ocr=False,allow_local_whisper=False,allow_cloud_stt=False,out_dir=p/'extraction',use_cache=False,frame_width=meta.width,max_frames=len(times),cue_timestamps=times)
-    obj=result.perception.to_dict();frames=[]
-    for i,f in enumerate(obj['frames']):
-        image=Path(f['path']).resolve();assert image.is_relative_to(p.resolve())
-        frames.append({'image_id':f'F{i:03d}','timestamp_seconds':f['timestamp_seconds'],'path':image.relative_to(p).as_posix(),'sha256':digest(image.read_bytes())})
+    frames=[]
+    if count<=120:
+        times=[round(i*j['interval'],3) for i in range(count) if i*j['interval']<duration-.08]
+        if not times:times=[0.0]
+        result=watch(str(src),run_ocr=False,allow_local_whisper=False,allow_cloud_stt=False,out_dir=p/'extraction',use_cache=False,frame_width=meta.width,max_frames=len(times),cue_timestamps=times)
+        images=[(Path(f['path']),f['timestamp_seconds']) for f in result.perception.to_dict()['frames']]
+        method='watch-skill pinned timestamps'
+    else:
+        # A single sequential decode is bounded in RAM even for hours of video.
+        out=p/'frames';out.mkdir(exist_ok=True)
+        cmd=[str(ffmpeg),'-hide_banner','-loglevel','error','-y','-i',str(src),'-an','-vf',f"fps=1/{j['interval']}:start_time=0:round=near:eof_action=pass",'-q:v','4','-start_number','0',str(out/'frame_%08d.jpg')]
+        run_media(jid,cmd,duration,'根拠画像を抽出しています')
+        images=[(image,round(i*j['interval'],3)) for i,image in enumerate(sorted(out.glob('frame_*.jpg')))]
+        method='ffmpeg sequential uniform fps; nominal resampled timestamps'
+    for i,(image,t) in enumerate(images):
+        image=image.resolve();assert image.is_relative_to(p.resolve())
+        frames.append({'image_id':f'F{i:03d}','timestamp_seconds':t,'path':image.relative_to(p).as_posix(),'sha256':file_digest(image)})
     if not frames:raise ValueError('動画から画像を抽出できませんでした。')
-    manifest={'frames':frames,'duration_seconds':duration,'interval_seconds':j['interval'],'video_sha256':digest(src.read_bytes())};write(p/'manifest.json',manifest)
+    manifest={'frames':frames,'duration_seconds':duration,'interval_seconds':j['interval'],'video_sha256':file_digest(src),'sampling_method':method};write(p/'manifest.json',manifest)
     change(jid,message='ブラウザで再生できる動画を準備しています。')
-    cmd=[str(ffmpeg),'-hide_banner','-loglevel','error','-y','-i',str(src),'-map','0:v:0','-map','0:a:0?','-vf','scale=min(1920\\,iw):-2','-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p','-c:a','aac','-movflags','+faststart',str(p/'video.mp4')]
-    try:r=subprocess.run(cmd,capture_output=True,timeout=300)
-    except subprocess.TimeoutExpired:raise ValueError('再生用動画の変換に時間がかかりすぎました。短い動画で試してください。') from None
-    if r.returncode:raise ValueError('再生用MP4を作成できませんでした。入力の映像コーデックを確認してください。')
-    change(jid,phase='prepared',message='画像抽出が完了しました。',frames_count=len(frames),video_file='video.mp4')
+    cmd=[str(ffmpeg),'-hide_banner','-loglevel','error','-y','-i',str(src),'-map','0:v:0','-map','0:a:0?']
+    cmd+=['-vf','scale=min(1920\\,iw):-2','-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p']
+    cmd+=['-c:a','aac','-movflags','+faststart',str(p/'video.mp4')]
+    run_media(jid,cmd,duration,'再生用動画を準備しています')
+    change(jid,phase='prepared',message='画像抽出が完了しました。長い動画は区間ごとに生成します。',frames_count=len(frames),video_file='video.mp4',progress=1)
 
-def request_body(jid):
+def request_body(jid,plan=None):
     p=jobdir(jid);m=read(p/'manifest.json');content=[]
-    for f in m['frames']:
+    selected_ids=set(plan['image_ids']) if plan else None
+    selected=m['frames'] if plan is None else [f for f in m['frames'] if f['image_id'] in selected_ids]
+    for f in selected:
         bb=(p/f['path']).read_bytes()
         if digest(bb)!=f['sha256']:raise ValueError('根拠画像が変更されています。動画を再登録してください。')
         content.extend([{'type':'text','text':f['image_id']},{'type':'image_url','image_url':{'url':'data:image/jpeg;base64,'+base64.b64encode(bb).decode(),'detail':'high'}}])
-    schema=Extraction.model_json_schema();schema['$defs']['Observation']['properties']['image_id']={'type':'string','enum':[f['image_id'] for f in m['frames']]}
-    return {'model':MODEL,'messages':[{'role':'system','content':PROMPT},{'role':'user','content':content}],'max_completion_tokens':MAX_OUTPUT,'reasoning_effort':'low','response_format':{'type':'json_schema','json_schema':{'name':'video_observations','strict':True,'schema':schema}},'service_tier':'default','store':False}
+    schema=Extraction.model_json_schema();schema['$defs']['Observation']['properties']['image_id']={'type':'string','enum':[f['image_id'] for f in selected]}
+    return {'model':MODEL,'messages':[{'role':'system','content':PROMPT+(segment_prompt(plan) if plan else '')},{'role':'user','content':content}],'max_completion_tokens':MAX_OUTPUT,'reasoning_effort':'low','response_format':{'type':'json_schema','json_schema':{'name':'video_observations','strict':True,'schema':schema}},'service_tier':'default','store':False}
 def api_post(path,body,timeout=180):
     # Deliberately no automatic retries for metered requests.
     try:
@@ -100,19 +135,46 @@ def api_post(path,body,timeout=180):
     except (httpx.TimeoutException,httpx.TransportError):raise ValueError('APIの通信結果を確認できません。自動再試行はしません。費用の確認が必要です。') from None
     if r.status_code!=200:raise ValueError(f'OpenAI APIでエラーが発生しました（HTTP {r.status_code}）。キー・利用権限・残高を確認してください。')
     return r.json()
-def estimate(jid):
-    change(jid,phase='estimating',message='画像をOpenAIへ送り、入力トークン数を確認しています。')
-    b=request_body(jid);items=[]
+def count_request(b):
+    items=[]
     for m in b['messages']:
         if isinstance(m['content'],str):items.append(m)
         else:items.append({'role':m['role'],'content':[{'type':'input_text','text':x['text']} if x['type']=='text' else {'type':'input_image','image_url':x['image_url']['url'],'detail':'high'} for x in m['content']]})
     counted=api_post('responses/input_tokens',{'model':MODEL,'input':items,'text':{'format':{'type':'json_schema',**b['response_format']['json_schema']}},'reasoning':{'effort':'low'}},120)
     n=counted['input_tokens']+4096
-    if n>272000:raise ValueError('入力が大きすぎます。動画を分割するか抽出間隔を広げてください。')
-    upper=round((n*2.5+MAX_OUTPUT*5)/1e6,6)
-    if upper>.60:raise ValueError('今回の最大費用がアプリの上限を超えます。動画を短くしてください。')
-    signature=digest(json.dumps(b,sort_keys=True).encode());write(jobdir(jid)/'estimate.json',{'upper_usd':upper,'max_input_tokens':n,'counted_input_tokens':counted['input_tokens'],'body_sha256':signature,'model':MODEL,'created':utc()})
-    change(jid,phase='awaiting_generation',message='費用を確認して生成してください。',estimate_usd=upper)
+    return n,counted['input_tokens']
+
+def estimate(jid):
+    p=jobdir(jid);frames=read(p/'manifest.json')['frames'];plans=plan_segments(frames);estimates=[]
+    # Completed requests are reused. Never automatically repeat a metered request.
+    previous=read(p/'estimate.json').get('segments',[]) if (p/'estimate.json').exists() else []
+    if previous:plans=[{k:x[k] for k in ('id','image_ids','owned_image_ids')} for x in previous]
+    reusable={x['id']:x for x in previous if (p/'segments'/x['id']/'settled.json').exists()}
+    queue=list(plans)
+    while queue:
+        plan=queue.pop(0)
+        change(jid,phase='estimating',message=f'区間 {len(estimates)+1}/{len(estimates)+len(queue)+1} の画像を送信し、費用を確認しています。')
+        b=request_body(jid,plan);signature=digest(json.dumps(b,sort_keys=True).encode())
+        old=reusable.get(plan['id'])
+        if old:
+            if old['body_sha256']!=signature:raise ValueError('完了済み区間の根拠が変わっています。別の動画として登録してください。')
+            estimates.append(old);continue
+        n,counted=count_request(b)
+        if n>272000:
+            owned=plan['owned_image_ids'];mid=len(owned)//2
+            if not mid:raise ValueError('1枚の画像がモデルの入力枠を超えました。画像解像度を下げてください。')
+            children=[]
+            for suffix,ids in [('L',owned[:mid]),('R',owned[mid:])]:
+                at=next(k for k,f in enumerate(frames) if f['image_id']==ids[0])
+                context=[f['image_id'] for f in frames[max(0,at-2):at]]
+                children.append({'id':plan['id']+suffix,'image_ids':context+ids,'owned_image_ids':ids})
+            queue[0:0]=children
+            continue
+        estimates.append({**plan,'upper_usd':round((n*2.5+MAX_OUTPUT*5)/1e6,6),'max_input_tokens':n,'counted_input_tokens':counted,'body_sha256':signature,'model':MODEL})
+    pending=[x for x in estimates if not (p/'segments'/x['id']/'settled.json').exists()]
+    upper=round(sum(x['upper_usd'] for x in pending),6)
+    write(p/'estimate.json',{'upper_usd':upper,'segments':estimates,'model':MODEL,'created':utc()})
+    change(jid,phase='awaiting_generation',message=f'{len(estimates)}区間に分けて生成します。残りの最大費用を確認してください。',estimate_usd=upper,segments_count=len(estimates),segments_done=len(estimates)-len(pending))
 
 class Budget:
     """Persistent local cap, including unresolved reservations."""
@@ -134,7 +196,7 @@ class Budget:
             return {'spent_usd':x['spent'],'unresolved':bool(x['pending']),'cap_usd':float(os.environ.get('VIDEO_MANUAL_BUDGET_USD','.60'))}
 BUDGET=Budget(DATA/'budget.json')
 
-def generate(jid):
+def generate_single(jid):
     p=jobdir(jid);est=read(p/'estimate.json');b=request_body(jid)
     if digest(json.dumps(b,sort_keys=True).encode())!=est['body_sha256']:raise ValueError('画像または生成条件が変わりました。もう一度準備してください。')
     BUDGET.reserve(jid,est['upper_usd']);rid=None
@@ -155,6 +217,50 @@ def generate(jid):
     try:parsed=json.loads(obj['choices'][0]['message']['content']);Extraction.model_validate(parsed)
     except Exception:raise ValueError('生成結果の形式を確認できませんでした。元の応答は保存されています。') from None
     write(p/'extraction.json',parsed);apply_extraction(jid,parsed)
+
+def generate(jid):
+    p=jobdir(jid);est=read(p/'estimate.json')
+    if 'segments' not in est:return generate_single(jid)
+    plans=est['segments'];remaining=[x for x in plans if not (p/'segments'/x['id']/'settled.json').exists()]
+    public=BUDGET.public()
+    if public['unresolved']:raise ValueError('結果未確認のAPI要求があります。費用を確認してから再開してください。')
+    if public['spent_usd']+sum(x['upper_usd'] for x in remaining)>public['cap_usd']:
+        raise ValueError(f"残りの最大費用はUSD {est['upper_usd']:.3f}です。累計予算の残額USD {max(0,public['cap_usd']-public['spent_usd']):.3f}を超えます。VIDEO_MANUAL_BUDGET_USDの設定を確認してください。")
+    # Verify the entire approved plan before the first paid request.
+    for plan in plans:
+        b=request_body(jid,plan)
+        if digest(json.dumps(b,sort_keys=True).encode())!=plan['body_sha256']:raise ValueError('根拠画像か生成条件が変わりました。費用を再確認してください。')
+    for i,plan in enumerate(plans):
+        folder=p/'segments'/plan['id'];folder.mkdir(parents=True,exist_ok=True)
+        if (folder/'settled.json').exists():continue
+        label=jid+'-'+plan['id'];BUDGET.reserve(label,plan['upper_usd']);rid=None
+        if external_reserve:
+            try:rid=external_reserve('app-'+label,plan['upper_usd'],{'model':MODEL,'max_input_tokens':plan['max_input_tokens'],'max_output_tokens':MAX_OUTPUT})
+            except Exception:
+                BUDGET.settle(label,0);raise ValueError('共有予算の確認に失敗しました。完了済み区間は保持されています。') from None
+        change(jid,phase='generating',message=f'区間 {i+1}/{len(plans)} の手順を抽出しています。',segments_done=i)
+        started=time.perf_counter();obj=api_post('chat/completions',request_body(jid,plan));write(folder/'response.json',obj)
+        u=obj['usage'];cached=u.get('prompt_tokens_details',{}).get('cached_tokens',0)
+        known=set(u.get('prompt_tokens_details',{}))<={'cached_tokens','audio_tokens'}
+        usd=((u['prompt_tokens']-cached)+cached*.05+u['completion_tokens']*5)/1e6 if known else (u['prompt_tokens']*2.5+u['completion_tokens']*5)/1e6
+        if u['prompt_tokens']>plan['max_input_tokens'] or usd>plan['upper_usd']:raise ValueError('費用見積もりと使用量が一致しません。保存済み応答と利用状況を確認してください。')
+        if external_settle and rid:external_settle(rid,'app-'+label,usd,u,time.perf_counter()-started)
+        BUDGET.settle(label,usd);write(folder/'settled.json',{'cost_usd':usd,'body_sha256':plan['body_sha256']})
+        change(jid,cost_usd=sum(read(x)['cost_usd'] for x in (p/'segments').glob('*/settled.json')),segments_done=i+1)
+    parts=[];manifest=read(p/'manifest.json')
+    for plan in plans:
+        obj=read(p/'segments'/plan['id']/'response.json')
+        if obj['choices'][0]['finish_reason']!='stop':raise ValueError('区間の生成が途中で終了しました。課金済みの応答を保持し、出力を保留しています。')
+        try:parsed=json.loads(obj['choices'][0]['message']['content']);Extraction.model_validate(parsed)
+        except Exception:raise ValueError('区間の応答形式が不正です。保存済み応答を確認してください。') from None
+        subset={'frames':[f for f in manifest['frames'] if f['image_id'] in plan['image_ids']]}
+        gate=validate_v2(parsed,subset);write(p/'segments'/plan['id']/'gate.json',gate)
+        if gate['status']=='blocked':
+            change(jid,phase='blocked',message='区間の根拠画像か順序に問題があるため、出力を保留しました。',issues=gate['structural_errors']);return
+        parts.append((plan,parsed))
+    try:merged=merge_segments(parts,manifest['frames'])
+    except ValueError as e:change(jid,phase='blocked',message=str(e));return
+    write(p/'extraction.json',merged);apply_extraction(jid,merged)
 
 def apply_extraction(jid,obj):
     p=jobdir(jid);m=read(p/'manifest.json');g=validate_v2(obj,m);write(p/'gate.json',g)
@@ -209,7 +315,8 @@ def save_manual(jid,updates):
     original.update(title=title.strip(),steps=steps,edited=True);write(p/'manual.json',original);return view(jid)
 
 def stamp(t):
-    minute=int(t//60);second=t-minute*60;return f'{minute:02d}:{second:04.1f}'
+    minute=int(t//60);second=t-minute*60
+    return (f'{minute//60}:{minute%60:02d}:{second:04.1f}' if minute>=60 else f'{minute:02d}:{second:04.1f}')
 def html_manual(jid):
     p=jobdir(jid);m=read(p/'manual.json');esc=html.escape;parts=[]
     for n,s in enumerate(m['steps'],1):
@@ -217,13 +324,13 @@ def html_manual(jid):
         parts.append(f'<section id="step-{n}"><h2>{n}. {esc(s["title"])}</h2><button class="jump" data-time="{s["start"]}">▶ 動画で確認 {stamp(s["start"])}〜{stamp(s["end"])}</button><p>{esc(s["text"])}</p><dl><dt>操作対象</dt><dd>{esc(s["target"])}</dd><dt>値</dt><dd>{esc(s["value"])}</dd></dl>'+ ('<p class="note">画面の変化から推定しています。</p>' if s['inferred'] else '')+(f'<p class="note">要確認：{esc(s["uncertainty"])}</p>' if s['uncertainty'] else '')+pictures+'</section>')
     questions=''.join('<li>'+esc(q)+'</li>' for q in m['questions'])
     return '<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+esc(m['title'])+'</title><style>body{margin:0;font:16px/1.8 system-ui;color:#203047;background:#f5f7fa}header,main{max-width:1360px;margin:auto;padding:24px}main{display:grid;grid-template-columns:1fr 1fr;gap:28px}.player{position:sticky;top:20px;align-self:start}video{width:100%;background:#15243a;border-radius:12px}section{background:white;padding:24px;margin-bottom:22px;border-radius:12px}img{width:100%}figure{margin:18px 0}button{cursor:pointer;color:#176a61;background:#e6f4ef;border:0;border-radius:7px;padding:9px 12px;font:inherit}.picture{padding:0;width:100%}h2{font-size:21px}.note{color:#775e27}dt{font-weight:bold}dd{margin:0 0 8px}.notice{background:#fff3d3;padding:14px;border-radius:8px}@media(max-width:800px){main{display:block}.player{position:relative;top:0;margin-bottom:24px}}@media print{.player,button{display:none}main{display:block}}</style><header><h1>'+esc(m['title'])+'</h1><p class="notice">録画を根拠にした下書きです。作業責任者の承認前です。時刻は根拠画像の範囲で、クリックした瞬間を特定するものではありません。</p></header><main><aside class="player"><video id="video" controls preload="metadata" src="video.mp4"></video><p id="position">手順の時刻や画像を押すと、動画の該当位置へ移動します。</p></aside><article>'+''.join(parts)+'<section><h2>未確認事項</h2><ul>'+questions+'</ul></section></article></main><script>const v=document.getElementById("video");function seek(t){const go=()=>{v.currentTime=t;v.play().catch(()=>{});document.getElementById("position").textContent="参照位置："+t.toFixed(1)+"秒";};if(v.readyState)go();else v.addEventListener("loadedmetadata",go,{once:true});}document.addEventListener("click",e=>{const b=e.target.closest("[data-time]");if(b)seek(Number(b.dataset.time));});</script></html>'
-def export_zip(jid):
-    p=jobdir(jid);m=read(p/'manual.json');frames={f['image_id']:f for f in read(p/'manifest.json')['frames']};buffer=io.BytesIO()
-    with zipfile.ZipFile(buffer,'w',zipfile.ZIP_DEFLATED) as z:
+def export_zip(jid,destination=None):
+    p=jobdir(jid);m=read(p/'manual.json');frames={f['image_id']:f for f in read(p/'manifest.json')['frames']};buffer=io.BytesIO() if destination is None else destination
+    with zipfile.ZipFile(buffer,'w',zipfile.ZIP_STORED,allowZip64=True) as z:
         z.writestr('manual.html',html_manual(jid));z.write(p/'video.mp4','video.mp4');z.writestr('manual.json',json.dumps(m,ensure_ascii=False,indent=2))
         for fid in dict.fromkeys(im['id'] for s in m['steps'] for im in s['images']):z.write(p/frames[fid]['path'],'images/'+fid+'.jpg')
         z.writestr('はじめに.txt','すべて展開してmanual.htmlをブラウザで開いてください。各手順の「動画で確認」や根拠画像を押すと、同梱動画の該当位置を再生します。フォルダ内のvideo.mp4とimagesを一緒に保管してください。作業責任者の承認前の下書きです。')
-    return buffer.getvalue()
+    return buffer.getvalue() if destination is None else destination
 def export_word(jid):
     from docx import Document
     from docx.shared import Inches
@@ -256,7 +363,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command!='HEAD':self.wfile.write(bb)
     def json(self,x,status=200):self.send(status,json.dumps(x,ensure_ascii=False).encode())
-    def file(self,p,ctype):
+    def file(self,p,ctype,filename=None):
         size=p.stat().st_size;start=0;end=size-1;code=200;value=self.headers.get('Range')
         if value:
             m=re.fullmatch(r'bytes=(\d*)-(\d*)',value)
@@ -268,6 +375,7 @@ class Handler(BaseHTTPRequestHandler):
             code=206
         self.send_response(code);self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(end-start+1));self.send_header('Accept-Ranges','bytes');self.send_header('X-Content-Type-Options','nosniff')
         if code==206:self.send_header('Content-Range',f'bytes {start}-{end}/{size}')
+        if filename:self.send_header('Content-Disposition',"attachment; filename*=UTF-8''"+quote(filename))
         self.end_headers()
         if self.command=='HEAD':return
         with p.open('rb') as f:
@@ -297,7 +405,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.file(p/f['path'],'image/jpeg');return
                 if j['phase']!='ready':raise ValueError('手順書が完成してからダウンロードできます。')
                 if q.get('format',['zip'])[0]=='docx':self.send(200,export_word(jid),'application/vnd.openxmlformats-officedocument.wordprocessingml.document','手順書.docx')
-                else:self.send(200,export_zip(jid),'application/zip','手順書と動画.zip')
+                else:
+                    export_path=p/('export-'+uuid.uuid4().hex+'.zip')
+                    try:export_zip(jid,export_path);self.file(export_path,'application/zip','手順書と動画.zip')
+                    finally:export_path.unlink(missing_ok=True)
                 return
             self.send(404,b'Not found','text/plain')
         except PermissionError as e:self.json({'error':str(e)},403)
@@ -307,12 +418,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             self.check_origin(True);u=urlparse(self.path);path=u.path;n=int(self.headers.get('Content-Length','0'))
-            if n<0 or n>MAX_BYTES:raise ValueError('動画は300MB以下で選択してください。')
+            if n<0:raise ValueError('ファイルサイズが不正です。')
             if path=='/api/upload':
+                if WORK.locked():raise ValueError('別の動画を処理中です。完了してから読み込んでください。')
                 q=parse_qs(u.query);name=q.get('name',['動画.mp4'])[0];ext=Path(name).suffix.lower();interval=float(q.get('interval',['.5'])[0])
                 if ext not in {'.mp4','.webm','.mov','.mkv','.avi','.m4v'}:raise ValueError('MP4、WebMなどの動画ファイルを選択してください。')
-                if interval not in {.5,1,2}:raise ValueError('抽出間隔が正しくありません。')
+                if interval not in {.5,1,2,5,10,30}:raise ValueError('抽出間隔が正しくありません。')
                 if not n:raise ValueError('空のファイルは利用できません。')
+                if n>shutil.disk_usage(DATA).free-16*1024*1024:raise ValueError('動画を保存するディスクの空き容量が不足しています。')
                 jid=new_job(Path(name).name,interval);p=jobdir(jid);filename='source'+ext
                 with (p/filename).open('wb') as f:
                     left=n
@@ -329,7 +442,8 @@ class Handler(BaseHTTPRequestHandler):
             jid,action=match.groups();j=load_job(jid)
             if action=='save':self.json(save_manual(jid,body));return
             key()
-            allowed=['prepared','awaiting_generation'] if action=='estimate' else ['awaiting_generation']
+            allowed=['prepared','awaiting_generation','error'] if action=='estimate' else ['awaiting_generation']
+            if action=='estimate' and not (jobdir(jid)/'manifest.json').exists():raise ValueError('動画の準備が完了していません。もう一度読み込んでください。')
             if j['phase'] not in allowed:raise ValueError('処理状態が変わりました。画面を再読み込みしてください。')
             submit(jid,estimate if action=='estimate' else generate);self.json({'id':jid})
         except PermissionError as e:self.json({'error':str(e)},403)

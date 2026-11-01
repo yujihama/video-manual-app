@@ -19,7 +19,10 @@ function playIcon() {
   path.setAttribute('d', 'M4 2.5 9 6 4 9.5Z'); path.setAttribute('fill', 'currentColor');
   svg.append(path); return svg;
 }
-function stamp(t) { return `${Math.floor(t / 60).toString().padStart(2, '0')}:${(t % 60).toFixed(1).padStart(4, '0')}`; }
+function stamp(t) {
+  const minutes = Math.floor(t / 60), seconds = (t % 60).toFixed(1).padStart(4, '0');
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}:${(minutes % 60).toString().padStart(2, '0')}:${seconds}` : `${minutes.toString().padStart(2, '0')}:${seconds}`;
+}
 function showError(text) { $('#error').textContent = text; $('#error').classList.toggle('hidden', !text); }
 async function api(path, data) {
   const options = data === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json', 'X-App-Token':token}, body:JSON.stringify(data)};
@@ -60,14 +63,20 @@ $('#file').onchange = () => {
 $('#upload-button').onclick = async () => {
   if (!guardDirty()) return;
   const f = $('#file').files[0]; if (!f) return;
-  if (f.size > 300 * 1024 * 1024) { showError('動画は300MB以下で選択してください。'); return; }
   showError(''); $('#upload-dialog').close(); $('#upload-button').disabled = true;
   $('#status-heading').textContent = '動画を読み込んでいます';
   $('#status-message').textContent = 'このPCに動画を保存しています。';
   $('#task-status').classList.remove('hidden'); $('#status-actions').replaceChildren();
   try {
-    const r = await fetch('/api/upload?name=' + encodeURIComponent(f.name) + '&interval=' + $('#interval').value, {method:'POST', headers:{'X-App-Token':token, 'Content-Type':'application/octet-stream'}, body:f});
-    const j = await r.json(); if (!r.ok) throw new Error(j.error);
+    const j = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/upload?name=' + encodeURIComponent(f.name) + '&interval=' + $('#interval').value);
+      xhr.setRequestHeader('X-App-Token', token); xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.upload.onprogress = e => { if (e.lengthComputable) $('#status-message').textContent = `このPCに動画を保存しています。${Math.round(e.loaded / e.total * 100)}%`; };
+      xhr.onload = () => { try { const result = JSON.parse(xhr.responseText); xhr.status < 300 ? resolve(result) : reject(new Error(result.error)); } catch { reject(new Error('アップロードの応答を確認できませんでした。')); } };
+      xhr.onerror = () => reject(new Error('動画の受信が中断されました。接続とディスクの空き容量を確認してください。'));
+      xhr.send(f);
+    });
     editing = false; dirty = false; await openJob(j.id);
   } catch (e) { showError(e.message); $('#task-status').classList.add('hidden'); }
   finally { $('#upload-button').disabled = false; }
@@ -112,14 +121,14 @@ function renderStatus() {
   $('#status-message').textContent = job.message;
   $('#progress-dot').classList.toggle('busy', ['queued','extracting','estimating','generating'].includes(job.phase));
   const actions = $('#status-actions'); actions.replaceChildren();
-  if (job.phase === 'prepared') {
-    const b = node('button', '生成の準備', 'button primary');
+  if (job.phase === 'prepared' || (job.phase === 'error' && job.frames_count)) {
+    const b = node('button', job.phase === 'error' ? '続きの生成を準備' : '生成の準備', 'button primary');
     b.onclick = () => consent('画面画像をOpenAIへ送信します', `${job.frames_count}枚の画像を送り、生成の最大費用を確認します。金額を確認した後、手順書の生成を開始できます。`, async () => { await api('/api/jobs/' + job.id + '/estimate', {}); await openJob(job.id); }, '送信して費用を確認');
     actions.append(b);
   }
   if (job.phase === 'awaiting_generation') {
     const b = node('button', `最大 USD ${job.estimate_usd.toFixed(3)} で生成`, 'button primary');
-    b.onclick = () => consent('手順書を生成します', `最大費用：USD ${job.estimate_usd.toFixed(3)}\n${job.frames_count}枚の画面画像から下書きを作成します。`, async () => { await api('/api/jobs/' + job.id + '/generate', {}); await openJob(job.id); }, '生成する');
+    b.onclick = () => consent('手順書を生成します', `残りの最大費用：USD ${job.estimate_usd.toFixed(3)}\n${job.frames_count}枚・${job.segments_count || 1}区間から下書きを作成します。完了した区間は再生成しません。`, async () => { await api('/api/jobs/' + job.id + '/generate', {}); await openJob(job.id); }, '生成する');
     actions.append(b);
   }
   if (job.phase === 'error' || job.phase === 'blocked') showError(job.message);
@@ -228,16 +237,9 @@ $('#save-button').onclick = async () => {
 };
 async function download(format) {
   if (!job || dirty) return;
-  const b = format === 'docx' ? $('#word-button') : $('#zip-button');
-  const old = b.textContent; b.disabled = true; b.textContent = '準備中…';
-  try {
-    const r = await fetch(`/api/jobs/${job.id}/export?format=${format}`);
-    if (!r.ok) { const x = await r.json(); throw new Error(x.error); }
-    const blob = await r.blob(); const url = URL.createObjectURL(blob); const a = node('a');
-    a.href = url; a.download = format === 'docx' ? '手順書.docx' : '手順書と動画.zip';
-    document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 30000);
-  } catch (e) { showError(e.message); }
-  finally { b.textContent = old; b.disabled = false; }
+  const a = node('a'); a.href = `/api/jobs/${job.id}/export?format=${format}`;
+  a.download = format === 'docx' ? '手順書.docx' : '手順書と動画.zip';
+  document.body.append(a); a.click(); a.remove();
 }
 $('#zip-button').onclick = () => download('zip'); $('#word-button').onclick = () => download('docx');
 function updateTime() {
